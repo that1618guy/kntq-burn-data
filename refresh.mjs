@@ -24,7 +24,8 @@ const SPLITTER = '0xfda2703df09b23caffc30dee6c73b4a12fc82faf';  // Ascend Protoc
 const KNTQ_EVM = '0xe45a355d9e9cad2ad85f2d03e3ee3102a036acf0';  // KNTQ on Elysium
 const WHYPE    = '0xba876237b0f021a6c6d852d6c26e107997cc5e81';
 const USDC     = '0xb47c4c8f73f009cc0c0d3f92b388d13e293f0b65';  // 6 decimals
-const BURN_SINKS = ['0x0000000000000000000000000000000000000000', '0x000000000000000000000000000000000000dead'];
+// Burn addresses on Elysium. The zero address is not one: KNTQ sent there is a bridge withdrawal to HyperEVM.
+const BURN_ADDRESSES = ['0x000000000000000000000000000000000000dead', '0xdead000000000000000042069420694206942069'];
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // The fee account receives each transaction's execution gas x price, tips included. The L1 data part
 // (gasUsedForL1 x price, nonzero before Nov 10) is paid toward posting to the parent chain, not to it.
@@ -137,7 +138,7 @@ async function ascendTreasury(prev) {
   const logs = async (address, topics) => rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: hex(N), address, topics }]);
   const kntqOut = await logs(KNTQ_EVM, [TRANSFER, pad32(treasury)]);
   const kntqIn = await logs(KNTQ_EVM, [TRANSFER, null, pad32(treasury)]);
-  const burned = kntqOut.filter(l => BURN_SINKS.includes('0x' + l.topics[2].slice(-40))).reduce((a, l) => a + BigInt(l.data), 0n);
+  const burned = kntqOut.filter(l => BURN_ADDRESSES.includes('0x' + l.topics[2].slice(-40))).reduce((a, l) => a + BigInt(l.data), 0n);
   const movedOut = kntqOut.reduce((a, l) => a + BigInt(l.data), 0n);
   // Buybacks: WHYPE leaving the treasury in a tx that returns KNTQ to it.
   const known = new Map((prev?.buybacks || []).map(b => [b.tx, b]));
@@ -169,7 +170,7 @@ async function ascendTreasury(prev) {
   // Each burn (KNTQ sent from the treasury to a burn address), with its time, so the page can date the first one.
   const knownBurns = new Map((prev?.burns || []).map(x => [x.tx + ':' + x.logIndex, x]));
   const burns = [];
-  for (const l of kntqOut.filter(l => BURN_SINKS.includes('0x' + l.topics[2].slice(-40)))) {
+  for (const l of kntqOut.filter(l => BURN_ADDRESSES.includes('0x' + l.topics[2].slice(-40)))) {
     const key = l.transactionHash + ':' + parseInt(l.logIndex, 16);
     if (knownBurns.has(key)) { burns.push(knownBurns.get(key)); continue; }
     const blk = await rpc('eth_getBlockByNumber', [l.blockNumber, false]);
@@ -289,7 +290,6 @@ if (hl) {
    the token gateway, so today every transfer to the zero address is a withdrawal to HyperEVM, where the tokens
    still exist. Each one is checked for the gateway's WithdrawalInitiated event in the same transaction, so a real
    burn call would be counted if one ever appeared. */
-const BURN_ADDRESSES = ['0x000000000000000000000000000000000000dead', '0xdead000000000000000042069420694206942069'];
 const ZERO = '0x0000000000000000000000000000000000000000';
 const WITHDRAWAL_INITIATED = '0x3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73';
 const KNOWN_FILE = new URL('./sources.json', import.meta.url);
