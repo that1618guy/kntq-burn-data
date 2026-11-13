@@ -4,7 +4,7 @@
 name: Refresh KNTQ burn data
 on:
   schedule:
-    - cron: "7,37 * * * *"   # every 30 min, off the top of the hour
+    - cron: "7,37 * * * *"   # every 30 min, at :07 and :37 (off the top of the hour)
   workflow_dispatch:
 permissions:
   contents: write
