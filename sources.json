@@ -1,0 +1,5 @@
+{
+  "about": "Confirmed app wallets for the KNTQ burn tracker. A burn on Elysium, or KNTQ reaching Hyperliquid's Assistance Fund, is credited to 'the sequencer or apps' when it comes from one of these, or when every inflow of the wallet that sent it traces back to one within 3 hops. The sequencer fee account and Ascend's burn treasury are read from the chain on every refresh and are not listed here.",
+  "howToAdd": "Add an object to apps: address (0x...), chain (elysium, hypercore or hyperevm), app (its name), label (what the wallet is), evidence (a link where the app itself states this address), added (YYYY-MM-DD). Only add an address the app has published or confirmed.",
+  "apps": []
+}

@@ -9,6 +9,8 @@
 //   3. Hyperliquid API  KNTQ and HYPE price, KNTQ supply, the Assistance Fund's KNTQ and who sent it
 // A source that fails keeps its previous value with that value's own timestamp; nothing is ever filled with 0.
 import { readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { makeTracer, TRACER_VERSION } from './attribution.mjs';
 
 const RPC     = process.env.ELYSIUM_RPC || 'https://rpc.elysium.kinetiq.xyz';
 const START   = process.env.START || '2026-11-05';          // first day charted (public mainnet: 2026-11-09 13:00 UTC)
@@ -257,21 +259,107 @@ if (hl) {
     history: hl.afKntq == null ? hist : [...hist, { date: now.slice(0, 10), kntq: hl.afKntq }].slice(-400),
   };
 }
-// Every KNTQ burn on Elysium: transfers to 0x...dead, grouped by sender. Transfers to the zero address are left out
-// on purpose: KNTQ on Elysium is a bridged token, and the zero address is where it goes when bridged back out.
-async function elysiumBurns(prev) {
-  const logs = await rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: 'latest', address: KNTQ_EVM, topics: [TRANSFER, null, pad32('0x000000000000000000000000000000000000dead')] }]);
-  const known = new Map((prev?.senders || []).map(x => [x.from, x.contract]));
-  const by = new Map();
-  for (const l of logs) {
-    const from = '0x' + l.topics[1].slice(-40);
-    if (!by.has(from)) by.set(from, { from, contract: known.has(from) ? known.get(from) : (await rpc('eth_getCode', [from, 'latest'])).length > 2, kntq: 0n, burns: 0, lastBlock: 0 });
-    const x = by.get(from); x.kntq += BigInt(l.data); x.burns++; x.lastBlock = Math.max(x.lastBlock, parseInt(l.blockNumber, 16));
+/* ---------- Burns ----------
+   Burned = every KNTQ burned on Elysium, from any sender, plus KNTQ that reaches Hyperliquid's Assistance Fund
+   when it traces back to the sequencer or an Elysium app.
+   On Elysium a burn is KNTQ sent to a burn address, or a burn call: a transfer to the zero address that is not a
+   bridge withdrawal. KNTQ on Elysium is Arbitrum's standard bridged token, whose only burn function answers to
+   the token gateway, so today every transfer to the zero address is a withdrawal to HyperEVM, where the tokens
+   still exist. Each one is checked for the gateway's WithdrawalInitiated event in the same transaction, so a real
+   burn call would be counted if one ever appeared. */
+const BURN_ADDRESSES = ['0x000000000000000000000000000000000000dead', '0xdead000000000000000042069420694206942069'];
+const ZERO = '0x0000000000000000000000000000000000000000';
+const WITHDRAWAL_INITIATED = '0x3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73';
+const KNOWN_FILE = new URL('./sources.json', import.meta.url);
+
+async function knownSources(seq, tre) {
+  const known = new Map(), list = [];
+  const add = (chain, address, label, kind, extra = {}) => { const k = chain + ':' + address.toLowerCase(); known.set(k, { label, kind, ...extra }); list.push({ chain, address: address.toLowerCase(), label, kind, ...extra }); };
+  if (seq?.feeAccount) add('elysium', seq.feeAccount, 'Elysium sequencer fee account', 'sequencer');
+  if (tre?.address) add('elysium', tre.address, "Ascend's burn treasury", 'app', { app: 'Ascend' });
+  const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
+  for (const a of file.apps || []) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(a.address || '') || !['elysium', 'hypercore', 'hyperevm'].includes(a.chain)) throw new Error('sources.json: bad entry ' + JSON.stringify(a));
+    add(a.chain, a.address, a.label || a.app, 'app', { app: a.app, evidence: a.evidence });
   }
-  const senders = [...by.values()].map(x => ({ ...x, kntq: +e18(x.kntq).toFixed(6) })).sort((a, b) => b.kntq - a.kntq);
-  return { sink: '0x000000000000000000000000000000000000dead', burns: logs.length, kntq: +senders.reduce((a, x) => a + x.kntq, 0).toFixed(6), senders };
+  const hash = createHash('sha256').update(JSON.stringify({ list, tracer: TRACER_VERSION })).digest('hex').slice(0, 16);
+  return { known, list, hash };
 }
-const eb = await step('elysiumBurns', () => elysiumBurns(prev?.elysiumBurns)); if (eb) data.elysiumBurns = { ...eb, at: now };
+
+async function burns(prev, K, af) {
+  // Each side gets its own time budget; wallets left untraced carry over to the next run.
+  let tracer = makeTracer({ rpc, known: K.known, deadline: Date.now() + 90e3 });
+  const N = parseInt(await rpc('eth_blockNumber', []), 16);
+  const old = new Map((prev?.events || []).map(e => [e.tx + ':' + e.logIndex, e]));
+  const oldZero = new Map((prev?.zeroChecked || []).map(z => [z.tx, z.withdrawal]));
+  const logsTo = to => rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: hex(N), address: KNTQ_EVM, topics: [TRANSFER, null, pad32(to)] }]);
+  const cand = [];
+  for (const a of BURN_ADDRESSES) for (const l of await logsTo(a)) cand.push({ l, how: 'burn address' });
+  const zeroChecked = [];
+  let withdrawals = 0, withdrawnKntq = 0;
+  for (const l of await logsTo(ZERO)) {
+    let w = oldZero.get(l.transactionHash);
+    if (w == null) { const rc = await rpc('eth_getTransactionReceipt', [l.transactionHash]); w = rc.logs.some(x => x.topics[0] === WITHDRAWAL_INITIATED); }
+    zeroChecked.push({ tx: l.transactionHash, withdrawal: w });
+    if (w) { withdrawals++; withdrawnKntq += e18(BigInt(l.data)); } else cand.push({ l, how: 'burn call' });
+  }
+  // Attribution: the token's sender or the transaction's sender is a known source, or the trail proves it.
+  const traced = new Map(prev?.registryHash === K.hash ? (prev?.actors || []).map(a => [a.actor, a]) : []);
+  const events = [];
+  for (const { l, how } of cand) {
+    const key = l.transactionHash + ':' + parseInt(l.logIndex, 16);
+    let e = old.get(key);
+    if (!e) {
+      const blk = await rpc('eth_getBlockByNumber', [l.blockNumber, false]), tx = await rpc('eth_getTransactionByHash', [l.transactionHash]);
+      e = { tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16), time: parseInt(blk.timestamp, 16),
+            from: '0x' + l.topics[1].slice(-40), actor: tx.from.toLowerCase(), to: '0x' + l.topics[2].slice(-40), how, kntq: +e18(BigInt(l.data)).toFixed(6) };
+    }
+    const direct = K.known.get('elysium:' + e.from) || K.known.get('elysium:' + e.actor);
+    let a = direct ? { actor: e.actor, credited: direct } : traced.get(e.actor);
+    if (!a || a.error) { a = { actor: e.actor, ...(await tracer.trace('elysium', e.actor, e.block)) }; traced.set(e.actor, a); }
+    events.push({ ...e, source: a.credited ? a.credited.label : null, kind: a.credited ? a.credited.kind : null, reason: a.credited ? null : (a.unidentified || 'not traced yet: ' + a.error) });
+  }
+  events.sort((x, y) => x.block - y.block || x.logIndex - y.logIndex);
+  const sum = xs => +xs.reduce((t, e) => t + e.kntq, 0).toFixed(6);
+  const credited = events.filter(e => e.source), other = events.filter(e => !e.source);
+
+  // Assistance Fund arrivals count only when the sender traces back to the sequencer or an Elysium app.
+  tracer = makeTracer({ rpc, known: K.known, deadline: Date.now() + 90e3 });
+  const afPrev = new Map(prev?.registryHash === K.hash ? (prev?.af?.senders || []).map(x => [x.from, x]) : []);
+  const afSenders = [];
+  for (const s of af?.senders || []) {
+    let t = afPrev.get(s.from);
+    if (!t || t.error || t.last !== s.last || !(t.credited || t.unidentified)) {
+      const direct = K.known.get('hypercore:' + s.from);
+      t = { from: s.from, last: s.last, ...(direct ? { credited: direct } : await tracer.trace('hypercore', s.from, s.last)) };
+    }
+    afSenders.push({ ...t, kntq: s.kntq, sends: s.sends });
+  }
+  const afCredited = afSenders.filter(x => x.credited);
+  const afKntq = +afCredited.reduce((t, x) => t + x.kntq, 0).toFixed(6);
+
+  // Alerts: a new wallet whose burn or Assistance Fund send could not be traced to a known source. Each wallet
+  // alerts once; the first run records what was already there without alerting.
+  const alerted = new Set(prev?.alerted || []), first = !prev?.alerted, alerts = [];
+  const flag = (who, what, reason) => { if (alerted.has(who)) return; alerted.add(who); if (!first) alerts.push({ at: now, who, what, reason }); };
+  for (const e of other) flag('elysium:' + e.actor, `burned ${e.kntq} KNTQ on Elysium (tx ${e.tx})`, e.reason);
+  for (const x of afSenders.filter(x => !x.credited)) flag('hypercore:' + x.from, `sent ${x.kntq.toFixed(2)} KNTQ to the Assistance Fund in ${x.sends} sends`, x.unidentified || x.error);
+  for (const a of alerts) log('ALERT source not identified:', a.who, a.what, '|', a.reason);
+
+  return {
+    total: +(sum(events) + afKntq).toFixed(6), fromSources: +(sum(credited) + afKntq).toFixed(6), fromOthers: sum(other),
+    elysium: { kntq: sum(events), count: events.length, credited: sum(credited), other: sum(other) },
+    af: { creditedKntq: afKntq, senders: afSenders.map(x => ({ from: x.from, kntq: +x.kntq.toFixed(6), sends: x.sends, last: x.last, source: x.credited?.label || null,
+           reason: x.credited ? null : (x.unidentified || 'not traced yet: ' + x.error), credited: x.credited || null, unidentified: x.unidentified || null, error: x.error || null })) },
+    excluded: { withdrawals, withdrawnKntq: +withdrawnKntq.toFixed(6), gateway: '0x5dc84e4cb0f9082246e92a5585c5395592b1af1f', router: '0x61ebbc3a29f1970af2ce862ba9c5364832e14d17', event: WITHDRAWAL_INITIATED },
+    burnAddresses: BURN_ADDRESSES, events, zeroChecked,
+    actors: [...traced.values()].map(a => ({ actor: a.actor, credited: a.credited || null, unidentified: a.unidentified || null, error: a.error || null })),
+    registryHash: K.hash, known: K.list, alerted: [...alerted], alerts, atBlock: N,
+  };
+}
+const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
+const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
+// data.elysiumBurns (the previous format) is left in place until the page that reads data.burns is live.
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
