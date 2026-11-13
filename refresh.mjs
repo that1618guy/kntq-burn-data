@@ -257,6 +257,21 @@ if (hl) {
     history: hl.afKntq == null ? hist : [...hist, { date: now.slice(0, 10), kntq: hl.afKntq }].slice(-400),
   };
 }
+// Every KNTQ burn on Elysium: transfers to 0x...dead, grouped by sender. Transfers to the zero address are left out
+// on purpose: KNTQ on Elysium is a bridged token, and the zero address is where it goes when bridged back out.
+async function elysiumBurns(prev) {
+  const logs = await rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: 'latest', address: KNTQ_EVM, topics: [TRANSFER, null, pad32('0x000000000000000000000000000000000000dead')] }]);
+  const known = new Map((prev?.senders || []).map(x => [x.from, x.contract]));
+  const by = new Map();
+  for (const l of logs) {
+    const from = '0x' + l.topics[1].slice(-40);
+    if (!by.has(from)) by.set(from, { from, contract: known.has(from) ? known.get(from) : (await rpc('eth_getCode', [from, 'latest'])).length > 2, kntq: 0n, burns: 0, lastBlock: 0 });
+    const x = by.get(from); x.kntq += BigInt(l.data); x.burns++; x.lastBlock = Math.max(x.lastBlock, parseInt(l.blockNumber, 16));
+  }
+  const senders = [...by.values()].map(x => ({ ...x, kntq: +e18(x.kntq).toFixed(6) })).sort((a, b) => b.kntq - a.kntq);
+  return { sink: '0x000000000000000000000000000000000000dead', burns: logs.length, kntq: +senders.reduce((a, x) => a + x.kntq, 0).toFixed(6), senders };
+}
+const eb = await step('elysiumBurns', () => elysiumBurns(prev?.elysiumBurns)); if (eb) data.elysiumBurns = { ...eb, at: now };
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
