@@ -287,8 +287,11 @@ async function knownSources(seq, tre) {
 }
 
 async function burns(prev, K, af) {
-  // Each side gets its own time budget; wallets left untraced carry over to the next run.
-  let tracer = makeTracer({ rpc, known: K.known, deadline: Date.now() + 90e3 });
+  // Time limits: 150 s for Elysium wallets and 90 s for Assistance Fund senders per run, at most 75 s per wallet,
+  // least-tried wallets first. A wallet that runs out of time three times is recorded as too slow to trace (its
+  // burns stay under other wallets), so one slow trail can never hold up the rest.
+  const elyEnd = Date.now() + 150e3;
+  const tracerFor = end => makeTracer({ rpc, known: K.known, deadline: Math.min(end, Date.now() + 75e3) });
   const N = parseInt(await rpc('eth_blockNumber', []), 16);
   const old = new Map((prev?.events || []).map(e => [e.tx + ':' + e.logIndex, e]));
   const oldZero = new Map((prev?.zeroChecked || []).map(z => [z.tx, z.withdrawal]));
@@ -305,7 +308,10 @@ async function burns(prev, K, af) {
   }
   // Attribution: the token's sender or the transaction's sender is a known source, or the trail proves it.
   const traced = new Map(prev?.registryHash === K.hash ? (prev?.actors || []).map(a => [a.actor, a]) : []);
+  const tries = new Map((prev?.actors || []).map(a => [a.actor, a.tries || 0]));
   const events = [];
+  // first pass: read each burn; second pass: trace the actors that still need it, least-tried first
+  const rows = [];
   for (const { l, how } of cand) {
     const key = l.transactionHash + ':' + parseInt(l.logIndex, 16);
     let e = old.get(key);
@@ -314,9 +320,23 @@ async function burns(prev, K, af) {
       e = { tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16), time: parseInt(blk.timestamp, 16),
             from: '0x' + l.topics[1].slice(-40), actor: tx.from.toLowerCase(), to: '0x' + l.topics[2].slice(-40), how, kntq: +e18(BigInt(l.data)).toFixed(6) };
     }
+    rows.push(e);
+  }
+  const need = new Map();
+  for (const e of rows) {
     const direct = K.known.get('elysium:' + e.from) || K.known.get('elysium:' + e.actor);
-    let a = direct ? { actor: e.actor, credited: direct } : traced.get(e.actor);
-    if (!a || a.error) { a = { actor: e.actor, ...(await tracer.trace('elysium', e.actor, e.block)) }; traced.set(e.actor, a); }
+    if (direct) { traced.set(e.actor, { actor: e.actor, credited: direct }); continue; }
+    const a = traced.get(e.actor);
+    if ((!a || a.error) && !need.has(e.actor)) need.set(e.actor, e.block);
+  }
+  for (const [actor, block] of [...need].sort((x, y) => (tries.get(x[0]) || 0) - (tries.get(y[0]) || 0))) {
+    if (Date.now() > elyEnd) { traced.set(actor, { actor, error: 'time budget for this run used up', tries: tries.get(actor) || 0 }); continue; }
+    const r = await tracerFor(elyEnd).trace('elysium', actor, block);
+    const n = (tries.get(actor) || 0) + (r.error ? 1 : 0);
+    traced.set(actor, r.error && n >= 3 ? { actor, unidentified: 'too slow to trace within the refresh time limit (3 tries)', tries: n } : { actor, ...r, tries: n });
+  }
+  for (const e of rows) {
+    const a = traced.get(e.actor) || { error: 'not traced' };
     events.push({ ...e, source: a.credited ? a.credited.label : null, kind: a.credited ? a.credited.kind : null, reason: a.credited ? null : (a.unidentified || 'not traced yet: ' + a.error) });
   }
   events.sort((x, y) => x.block - y.block || x.logIndex - y.logIndex);
@@ -324,14 +344,14 @@ async function burns(prev, K, af) {
   const credited = events.filter(e => e.source), other = events.filter(e => !e.source);
 
   // Assistance Fund arrivals count only when the sender traces back to the sequencer or an Elysium app.
-  tracer = makeTracer({ rpc, known: K.known, deadline: Date.now() + 90e3 });
+  const afEnd = Date.now() + 90e3;
   const afPrev = new Map(prev?.registryHash === K.hash ? (prev?.af?.senders || []).map(x => [x.from, x]) : []);
   const afSenders = [];
   for (const s of af?.senders || []) {
     let t = afPrev.get(s.from);
     if (!t || t.error || t.last !== s.last || !(t.credited || t.unidentified)) {
       const direct = K.known.get('hypercore:' + s.from);
-      t = { from: s.from, last: s.last, ...(direct ? { credited: direct } : await tracer.trace('hypercore', s.from, s.last)) };
+      t = { from: s.from, last: s.last, ...(direct ? { credited: direct } : Date.now() > afEnd ? { error: 'time budget for this run used up' } : await tracerFor(afEnd).trace('hypercore', s.from, s.last)) };
     }
     afSenders.push({ ...t, kntq: s.kntq, sends: s.sends });
   }
@@ -353,7 +373,7 @@ async function burns(prev, K, af) {
            reason: x.credited ? null : (x.unidentified || 'not traced yet: ' + x.error), credited: x.credited || null, unidentified: x.unidentified || null, error: x.error || null })) },
     excluded: { withdrawals, withdrawnKntq: +withdrawnKntq.toFixed(6), gateway: '0x5dc84e4cb0f9082246e92a5585c5395592b1af1f', router: '0x61ebbc3a29f1970af2ce862ba9c5364832e14d17', event: WITHDRAWAL_INITIATED },
     burnAddresses: BURN_ADDRESSES, events, zeroChecked,
-    actors: [...traced.values()].map(a => ({ actor: a.actor, credited: a.credited || null, unidentified: a.unidentified || null, error: a.error || null })),
+    actors: [...traced.values()].map(a => ({ actor: a.actor, credited: a.credited || null, unidentified: a.unidentified || null, error: a.error || null, tries: a.tries || 0 })),
     registryHash: K.hash, known: K.list, alerted: [...alerted], alerts, atBlock: N,
   };
 }
