@@ -555,7 +555,7 @@ async function projects(prev, kq) {
   const sumPaid = bs => bs.reduce((o, b) => { for (const [k, v] of Object.entries(b.paid)) o[k] = +((o[k] || 0) + v).toFixed(6); return o; }, {});
   const list = [...ours.map(p => ({ ...p, source: p.source || 'ours' })), ...added.values()].map(p => {
     const ws = wallets.filter(w => w.app === p.name), buys = ws.flatMap(w => w.buys), burns = ws.flatMap(w => w.burns);
-    const row = { name: p.name, commitment: p.commitment, kinetiq: p.kinetiq || null, chain: p.chain || null, source: p.source, note: p.note || null, wallets: ws.length };
+    const row = { name: p.name, commitment: p.commitment, kinetiq: p.kinetiq || null, chain: p.chain || null, source: p.source, kind: p.kind === 'buy' ? 'buy' : 'burn', note: p.note || null, wallets: ws.length };
     if (ws.length) Object.assign(row, { verified: true, complete: ws.every(w => w.complete && !w.error),
       bought: +buys.reduce((s, b) => s + b.kntq, 0).toFixed(6), paid: sumPaid(buys), burned: +burns.reduce((s, b) => s + b.kntq, 0).toFixed(6),
       buys: buys.length, lastBuy: buys.length ? Math.max(...buys.map(b => b.time)) : null,
