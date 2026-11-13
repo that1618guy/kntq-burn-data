@@ -442,6 +442,129 @@ async function kinetiq(tre, afKntq) {
   };
 }
 const kq = await step('kinetiq', () => kinetiq(data.ascendTreasury, data.assistanceFund?.kntq)); if (kq) data.kinetiq = { ...kq, at: now };
+/* ---------- Projects buying KNTQ ----------
+   The table is sources.json's projects list. Two things are added here:
+   1. A project in Kinetiq's "projects buying KNTQ" data that is not in the list is added as pledged, not verifiable,
+      with Kinetiq as its source, and raises an alert once. It leaves the added list when it is put into sources.json.
+   2. Each app wallet in sources.json has its whole history read: buys (KNTQ arriving in a transaction in which
+      the wallet also paid something out, with what it paid) and burns (KNTQ to a burn address on Elysium, or to the
+      Assistance Fund on Hyperliquid). History is cached per wallet; a wallet the cache has not seen yet is read from
+      Elysium's first block, or from the start of its Hyperliquid history, so adding a wallet backfills everything it
+      ever did, not only what comes after. A long history is read over several runs and shown as incomplete until done. */
+const BUY_READS_PER_RUN = 300;
+const tokenMeta = new Map([[WHYPE, { symbol: 'HYPE', decimals: 18 }], [USDC, { symbol: 'USDC', decimals: 6 }]]);
+async function token(addr) {
+  if (tokenMeta.has(addr)) return tokenMeta.get(addr);
+  const dec = Number(BigInt(await rpc('eth_call', [{ to: addr, data: '0x313ce567' }, 'latest']).catch(() => '0x12')));
+  let symbol = addr.slice(0, 8);
+  try { const r = await rpc('eth_call', [{ to: addr, data: '0x95d89b41' }, 'latest']); const n = parseInt(r.slice(66, 130), 16);
+        symbol = Buffer.from(r.slice(130, 130 + n * 2), 'hex').toString('utf8') || symbol; } catch {}
+  const m = { symbol, decimals: dec }; tokenMeta.set(addr, m); return m;
+}
+const blockTimes = new Map();
+const blockTime = async b => { if (!blockTimes.has(b)) blockTimes.set(b, parseInt((await rpc('eth_getBlockByNumber', [hex(b), false])).timestamp, 16)); return blockTimes.get(b); };
+
+async function elysiumWallet(w, N, budget) {
+  const a = w.address, from = w.atBlock == null ? 0 : w.atBlock + 1;
+  if (from <= N) {
+    const logs = topics => rpc('eth_getLogs', [{ fromBlock: hex(from), toBlock: hex(N), address: KNTQ_EVM, topics }]);
+    for (const l of await logs([TRANSFER, pad32(a)])) {
+      const to = '0x' + l.topics[2].slice(-40);
+      if (BURN_ADDRESSES.includes(to)) w.burns.push({ tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16), to, kntq: +e18(BigInt(l.data)).toFixed(6) });
+    }
+    for (const l of await logs([TRANSFER, null, pad32(a)])) w.pending.push({ tx: l.transactionHash, block: parseInt(l.blockNumber, 16) });
+    w.atBlock = N;
+  }
+  // Each inflow's transaction is read once. It is a buy when the wallet also paid something out in it (a token, or
+  // HYPE if it sent the transaction), whoever sent it: contract wallets are often run by a keeper.
+  const done = new Set(w.buys.map(b => b.tx).concat(w.notBuys));
+  while (w.pending.length && budget.n > 0) {
+    const { tx, block } = w.pending.shift(); if (done.has(tx)) continue; done.add(tx); budget.n--;
+    const rc = await rpc('eth_getTransactionReceipt', [tx]);
+    const got = rc.logs.filter(x => x.address.toLowerCase() === KNTQ_EVM && x.topics[0] === TRANSFER && x.topics[2] === pad32(a)).reduce((s, x) => s + BigInt(x.data), 0n);
+    const paid = {};
+    if (rc.from.toLowerCase() === a) { const t = await rpc('eth_getTransactionByHash', [tx]); if (BigInt(t.value) > 0n) paid.HYPE = e18(BigInt(t.value)); }
+    for (const x of rc.logs.filter(x => x.topics[0] === TRANSFER && x.topics[1] === pad32(a) && x.address.toLowerCase() !== KNTQ_EVM && x.topics.length === 3)) {
+      const m = await token(x.address.toLowerCase()); paid[m.symbol] = (paid[m.symbol] || 0) + Number(BigInt(x.data)) / 10 ** m.decimals;
+    }
+    if (!Object.keys(paid).length) { w.notBuys.push(tx); continue; }               // KNTQ in, nothing paid: not a buy
+    w.buys.push({ tx, block, time: await blockTime(block), kntq: +e18(got).toFixed(6), paid: Object.fromEntries(Object.entries(paid).map(([k, v]) => [k, +v.toFixed(6)])) });
+  }
+  for (const b of w.burns) if (b.time == null) b.time = await blockTime(b.block);
+  w.complete = w.pending.length === 0;
+}
+
+async function hypercoreWallet(w) {
+  const a = w.address;
+  const post = async body => { const r = await fetch(HL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
+    if (!r.ok) throw new Error('hyperliquid ' + body.type + ' HTTP ' + r.status); return r.json(); };
+  const meta = await post({ type: 'spotMeta' });
+  const kntq = meta.tokens.find(t => t.name === 'KNTQ').index, name = i => meta.tokens.find(t => t.index === i)?.name;
+  const pairs = new Map(meta.universe.filter(u => u.tokens[0] === kntq).map(u => [u.name, name(u.tokens[1])]));
+  for (let start = (w.fillsTo ?? -1) + 1, page = 0; page < 20; page++) {                // from the first fill, for a new wallet
+    const fills = await post({ type: 'userFillsByTime', user: a, startTime: start, endTime: Date.now() });
+    if (!Array.isArray(fills) || !fills.length) break;
+    for (const f of fills) if (pairs.has(f.coin) && f.side === 'B' && !w.buys.some(b => b.tx === f.hash + ':' + f.tid))
+      w.buys.push({ tx: f.hash + ':' + f.tid, time: Math.floor(f.time / 1000), kntq: +f.sz, paid: { [pairs.get(f.coin)]: +(+f.px * +f.sz).toFixed(6) } });
+    const last = Math.max(...fills.map(f => f.time)); w.fillsTo = last; start = last + 1;
+    if (fills.length < 2000) break;
+  }
+  for (let start = (w.ledgerTo ?? -1) + 1, page = 0; page < 20; page++) {
+    const rows = await post({ type: 'userNonFundingLedgerUpdates', user: a, startTime: start, endTime: Date.now() });
+    if (!Array.isArray(rows) || !rows.length) break;
+    for (const r of rows) { const d = r.delta || {};
+      if (d.token === 'KNTQ' && ['send', 'spotTransfer'].includes(d.type) && (d.user || '').toLowerCase() === a && (d.destination || '').toLowerCase() === AF)
+        w.burns.push({ tx: r.hash, time: Math.floor(r.time / 1000), to: AF, kntq: +d.amount }); }
+    const last = Math.max(...rows.map(r => r.time)); w.ledgerTo = last; start = last + 1;
+    if (rows.length < 500) break;
+  }
+  w.complete = true;
+}
+
+async function projects(prev, kq) {
+  const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
+  const ours = file.projects || [];
+  for (const p of ours) if (!p.name || !p.commitment) throw new Error('sources.json: project needs name and commitment ' + JSON.stringify(p));
+  const slugs = new Set(ours.map(p => p.kinetiq).filter(Boolean)), names = new Set(ours.map(p => p.name));
+  const alerted = new Set(prev?.alerted || []), alerts = [];
+  const alert = (key, what) => { if (alerted.has(key)) return; alerted.add(key); alerts.push({ at: new Date().toISOString(), what }); log('ALERT', what); };
+  // 1. Kinetiq's list against ours (kept from the last run when Kinetiq could not be read)
+  const added = new Map((prev?.added || []).filter(x => !slugs.has(x.kinetiq)).map(x => [x.kinetiq, x]));
+  if (kq) for (const p of kq.projects) if (!slugs.has(p.slug) && !added.has(p.slug))
+    added.set(p.slug, { name: p.title, commitment: p.commitment, kinetiq: p.slug, source: 'kinetiq', firstSeen: new Date().toISOString() });
+  for (const x of added.values()) alert('kinetiq:' + x.kinetiq, `Kinetiq lists a project buying KNTQ that is not in the table: ${x.name} ("${x.commitment}"). Added as pledged, not verifiable.`);
+  // 2. app wallets, each with its whole history
+  const N = parseInt(await rpc('eth_blockNumber', []), 16), budget = { n: BUY_READS_PER_RUN };
+  const cache = new Map((prev?.wallets || []).map(w => [w.chain + ':' + w.address, w]));
+  const wallets = [];
+  for (const app of file.apps || []) {
+    const key = app.chain + ':' + app.address.toLowerCase();
+    let w = cache.get(key);
+    if (!w) { w = { chain: app.chain, address: app.address.toLowerCase(), buys: [], burns: [], pending: [], notBuys: [], added: new Date().toISOString() };
+              log(`new wallet ${key} for ${app.app}: reading its whole history`); }
+    Object.assign(w, { app: app.app, label: app.label || app.app, error: null });
+    if (!names.has(app.app) && ![...added.values()].some(x => x.name === app.app)) alert('wallet-project:' + key, `sources.json lists wallet ${key} for "${app.app}", which is not a project in the table.`);
+    try {
+      if (w.chain === 'elysium') await elysiumWallet(w, N, budget);
+      else if (w.chain === 'hypercore') await hypercoreWallet(w);
+      else { w.complete = false; w.error = 'HyperEVM wallet history is not read yet'; }
+    } catch (e) { w.error = e.message; log(`wallet ${key} FAILED: ${e.message} (kept what was read)`); }
+    wallets.push(w);
+  }
+  // rows: our list, then Kinetiq's additions, each with the totals of its wallets
+  const sumPaid = bs => bs.reduce((o, b) => { for (const [k, v] of Object.entries(b.paid)) o[k] = +((o[k] || 0) + v).toFixed(6); return o; }, {});
+  const list = [...ours.map(p => ({ ...p, source: p.source || 'ours' })), ...added.values()].map(p => {
+    const ws = wallets.filter(w => w.app === p.name), buys = ws.flatMap(w => w.buys), burns = ws.flatMap(w => w.burns);
+    const row = { name: p.name, commitment: p.commitment, kinetiq: p.kinetiq || null, chain: p.chain || null, source: p.source, note: p.note || null, wallets: ws.length };
+    if (ws.length) Object.assign(row, { verified: true, complete: ws.every(w => w.complete && !w.error),
+      bought: +buys.reduce((s, b) => s + b.kntq, 0).toFixed(6), paid: sumPaid(buys), burned: +burns.reduce((s, b) => s + b.kntq, 0).toFixed(6),
+      buys: buys.length, lastBuy: buys.length ? Math.max(...buys.map(b => b.time)) : null,
+      reading: ws.reduce((s, w) => s + (w.pending?.length || 0), 0) });
+    return row;
+  });
+  return { list, added: [...added.values()], wallets, alerted: [...alerted], alerts, atBlock: N };
+}
+const pj = await step('projects', () => projects(prev?.projects, data.kinetiq)); if (pj) data.projects = { ...pj, at: now };
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
