@@ -1,6 +1,6 @@
 # kntq-burn-data
 
-Data behind the KNTQ burn tracker at https://stateofblocks.com/dashboards/kntq-burn/.
+Data behind Elysium Terminal at https://stateofblocks.com/dashboards/elysium/.
 
 `refresh.mjs` runs every 30 minutes (`.github/workflows/refresh.yml`) and rewrites `data.json`:
 
