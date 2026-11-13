@@ -379,7 +379,7 @@ async function burns(prev, K, af) {
 }
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
-// data.elysiumBurns (the previous format) is left in place until the page that reads data.burns is live.
+delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
