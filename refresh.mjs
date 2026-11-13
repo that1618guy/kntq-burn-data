@@ -195,9 +195,11 @@ async function hyperliquid(prev) {
     const ctx = ctxs.find(c => c.coin === pair.name); if (!ctx) throw new Error(`no context for ${pair.name}`);
     const price = +(ctx.midPx ?? ctx.markPx);
     if (!(price > 0)) throw new Error(`${name} price not positive`);
-    return { price, pair: pair.name, total: +ctx.totalSupply };
+    return { price, pair: pair.name, total: +ctx.totalSupply, vol24: +ctx.dayNtlVlm, tokenId: tok.tokenId };
   };
   const kntq = spot('KNTQ'), hype = spot('HYPE');
+  const det = await post({ type: 'tokenDetails', tokenId: kntq.tokenId });            // max supply, for the FDV
+  const maxSupply = +det.maxSupply; if (!(maxSupply > 0)) throw new Error('KNTQ max supply not positive');
   const state = await post({ type: 'spotClearinghouseState', user: AF });
   if (!Array.isArray(state.balances)) throw new Error('Assistance Fund state has no balances');
   const held = state.balances.find(b => b.coin === 'KNTQ');
@@ -207,7 +209,7 @@ async function hyperliquid(prev) {
   const senders = Object.fromEntries((prevF.senders || []).map(x => [x.from, { ...x }]));
   // one-time migration from the old full-ledger format
   if (!prevF.senders && Array.isArray(prevF.ledger)) for (const r of prevF.ledger) { const x = senders[r.from] ||= { from: r.from, kntq: 0, sends: 0, first: r.time, last: r.time }; x.kntq += r.kntq; x.sends++; x.last = r.time; }
-  let recent = [...(prevF.recent || prevF.ledger || [])].slice(-RECENT);
+  let recent = prevF.recent ? [...prevF.recent] : [...(prevF.ledger || [])].slice(-RECENT);
   let lastTime = prevF.lastTime || (recent.length ? recent[recent.length - 1].time : Date.parse('2024-10-01') - 1);
   let start = lastTime + 1;
   for (let page = 0; page < 40; page++) {
@@ -224,8 +226,28 @@ async function hyperliquid(prev) {
     const last = Math.max(...r.map(x => x.time)); if (last < start) break; start = last + 1;
     if (r.length < 500) break;
   }
-  recent = recent.slice(-RECENT);
-  return { kntq: kntq.price, kntqPair: kntq.pair, hype: hype.price, hypePair: hype.pair, supplyTotal: kntq.total,
+  /* Rows kept: everything from the last WINDOW (so the page can sum the last 24 h and 7 d), and never fewer than
+     RECENT. recentSince is the time from which the rows are complete; until it is, the 7-day sum is not shown.
+     The first run after this was added rebuilds the window from the ledger once. */
+  const since = Date.now() - WINDOW_MS;
+  let recentSince = prevF.recentSince ?? null;
+  if (recentSince == null || recentSince > since) {
+    const rows = []; let s0 = since;
+    for (let page = 0; page < 60; page++) {
+      const r = await post({ type: 'userNonFundingLedgerUpdates', user: AF, startTime: s0, endTime: Date.now() });
+      if (!Array.isArray(r) || !r.length) break;
+      for (const x of r) if (x.delta?.token === 'KNTQ' && ['send', 'spotTransfer'].includes(x.delta.type) && (x.delta.destination || '').toLowerCase() === AF)
+        rows.push({ time: x.time, from: (x.delta.user || '').toLowerCase(), kntq: +x.delta.amount, hash: x.hash });
+      const last = Math.max(...r.map(x => x.time)); if (r.length < 500 || last < s0) break; s0 = last + 1;
+      if (page === 59) throw new Error('Assistance Fund ledger window did not finish in 60 pages');
+    }
+    const seen = new Set(rows.map(r => r.hash + r.time + r.kntq));
+    recent = [...recent.filter(r => r.time < since && !seen.has(r.hash + r.time + r.kntq)), ...rows].sort((a, b) => a.time - b.time);
+    recentSince = since;
+  }
+  recent = recent.filter((r, i) => r.time >= since || i >= recent.length - RECENT);
+  recentSince = Math.max(recentSince, since);
+  return { recentSince, kntq: kntq.price, kntqPair: kntq.pair, hype: hype.price, hypePair: hype.pair, supplyTotal: kntq.total, maxSupply, kntqVol24: kntq.vol24,
            afKntq: held ? +held.total : null, senders: Object.values(senders), recent, lastTime };
 }
 
@@ -244,15 +266,15 @@ const step = async (name, fn) => { try { return await fn(); } catch (e) { log(`$
 const seq = await step('sequencer', () => sequencer(prev?.sequencer));        if (seq) data.sequencer = { ...seq, at: now };
 const asc = await step('ascend', ascendUsd);                                   if (asc && asc.length) data.ascend = { ...(data.ascend || {}), days: asc, at: now };
 const tre = await step('ascendTreasury', () => ascendTreasury(prev?.ascendTreasury)); if (tre) data.ascendTreasury = { ...tre, at: now };
-const RECENT = 60;
+const RECENT = 60, WINDOW_MS = 8 * 86400e3;
 const hl  = await step('hyperliquid', () => hyperliquid(prev?.assistanceFund));
 if (hl) {
-  data.prices = { kntq: hl.kntq, kntqPair: hl.kntqPair, hype: hl.hype, hypePair: hl.hypePair, at: now };
-  data.supply = { total: hl.supplyTotal, at: now };
+  data.prices = { kntq: hl.kntq, kntqPair: hl.kntqPair, hype: hl.hype, hypePair: hl.hypePair, kntqVol24Usd: hl.kntqVol24, at: now };
+  data.supply = { total: hl.supplyTotal, max: hl.maxSupply, at: now };
   const ledgerSum = hl.senders.reduce((a, x) => a + x.kntq, 0);
   const hist = (prev?.assistanceFund?.history || []).filter(h => h.date !== now.slice(0, 10));
   data.assistanceFund = {
-    kntq: hl.afKntq, at: now, lastTime: hl.lastTime, recent: hl.recent, ledgerSum: +ledgerSum.toFixed(6),
+    kntq: hl.afKntq, at: now, lastTime: hl.lastTime, recent: hl.recent, recentSince: hl.recentSince, ledgerSum: +ledgerSum.toFixed(6),
     // The balance must equal the sum of the sends we can see, or the breakdown is incomplete.
     ledgerMatchesBalance: hl.afKntq != null && Math.abs(ledgerSum - hl.afKntq) < 0.01,
     senders: hl.senders.sort((a, b) => b.kntq - a.kntq).map(x => ({ ...x, kntq: +x.kntq.toFixed(6) })),
@@ -377,6 +399,49 @@ async function burns(prev, K, af) {
     registryHash: K.hash, known: K.list, alerted: [...alerted], alerts, atBlock: N,
   };
 }
+/* ---------- Kinetiq's own figures, cross-checked ----------
+   kinetiq.xyz/kntq fills its "Projects buying KNTQ" table and its supply numbers from three routes of its own site.
+   They are undocumented and unversioned, so every field is shape-checked, a project with no totals is kept as "not
+   tracked" (never as zero), and each figure that the chain can confirm is checked against the chain here. */
+const KINETIQ = 'https://kinetiq.xyz/api/kntq-data/';
+const HYPEREVM = 'https://rpc.hyperliquid.xyz/evm';
+const SKNTQ = '0x696238e0ca31c94e24ca4cbe7921754e172e4d0f';   // Staked KNTQ (ERC-4626 vault) on HyperEVM
+async function kinetiq(tre, afKntq) {
+  const get = async path => { const r = await fetch(KINETIQ + path, { headers: { 'user-agent': 'stateofblocks-kntq-burn' }, signal: AbortSignal.timeout(30000) });
+    if (!r.ok) throw new Error(`${path} HTTP ${r.status}`); return r.json(); };
+  const num = (v, what) => { const n = typeof v === 'string' ? +v : v; if (typeof n !== 'number' || !Number.isFinite(n)) throw new Error(`${what} is not a number`); return n; };
+  const [eco, sup, vol] = await Promise.all([get('ecosystem-buybacks'), get('supply-breakdown?chainId=999'), get('volume')]);
+  if (!Array.isArray(eco?.projects)) throw new Error('ecosystem-buybacks has no projects list');
+  // the chain's own reading of what Kinetiq reports
+  const call = async (to, data) => { const r = await fetch(HYPEREVM, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(30000),
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to, data }, 'latest'] }) }).then(r => r.json());
+    if (!r.result || r.result === '0x') throw new Error('HyperEVM call failed: ' + (r.error?.message || 'empty')); return r.result; };
+  const stakedChain = Number(BigInt(await call(SKNTQ, '0x01e1d114'))) / 1e18;            // totalAssets()
+  const close = (a, b, tol) => a != null && b != null && Math.abs(a - b) <= Math.max(tol, Math.abs(b) * 1e-4);
+  const projects = eco.projects.map(p => {
+    const t = p.totals, tracked = t != null;
+    const row = { slug: String(p.slug), title: String(p.title), commitment: String(p.commitment ?? ''), share: p.share ?? null, tracked,
+      bought: tracked ? num(t.kntqAmount, p.slug + ' bought') : null, spentUsd: tracked ? num(t.usdValue, p.slug + ' spent') : null,
+      burned: tracked ? num(t.burnedKntqAmount, p.slug + ' burned') : null, lastBuy: tracked ? (t.lastTime ?? null) : null,
+      days: Array.isArray(p.days) ? p.days.length : null };
+    // Cross-check where the chain has an address for the project. Only Ascend has one today: its burn treasury.
+    if (p.slug === 'ascend' && tre) {
+      const chain = { bought: tre.kntqFromBuybacks, burned: tre.kntqBurned, buys: tre.buybacks?.length ?? null, lastBuy: tre.buybacks?.length ? tre.buybacks[tre.buybacks.length - 1].time * 1000 : null };
+      const ok = tracked && close(row.bought, chain.bought, 1) && close(row.burned, chain.burned, 1);
+      row.check = { status: ok ? 'match' : 'mismatch', chain, against: `Ascend's burn treasury ${tre.address} on Elysium` };
+    } else row.check = { status: 'no address', note: 'No wallet or burn address for this project is known, so the chain cannot confirm or contradict the figure.' };
+    return row;
+  });
+  const supply = { staked: num(sup.amountStaked, 'amountStaked'), circulating: num(sup.circulatingSupply, 'circulatingSupply'), burned: num(sup.amountBurned, 'amountBurned') };
+  return {
+    source: 'kinetiq.xyz/kntq (routes /api/kntq-data/ecosystem-buybacks, supply-breakdown, volume)', projects, supply, volumeUsd: num(vol.volume, 'volume'),
+    chain: { staked: stakedChain, stakedVault: SKNTQ, afKntq },
+    // Kinetiq's figures are cached on its side and the Fund takes sends every hour, so small timing gaps are allowed
+    checks: { staked: close(supply.staked, stakedChain, stakedChain * 0.002) ? 'match' : 'mismatch', stakedDiff: +(supply.staked - stakedChain).toFixed(2),
+              burned: afKntq == null ? 'unchecked' : close(supply.burned, afKntq, afKntq * 0.005) ? 'match' : 'mismatch', burnedDiff: afKntq == null ? null : +(supply.burned - afKntq).toFixed(2) },
+  };
+}
+const kq = await step('kinetiq', () => kinetiq(data.ascendTreasury, data.assistanceFund?.kntq)); if (kq) data.kinetiq = { ...kq, at: now };
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
