@@ -164,10 +164,20 @@ async function ascendTreasury(prev) {
     const blk = await rpc('eth_getBlockByNumber', [l.blockNumber, false]);
     kntqFees.push({ tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16), time: parseInt(blk.timestamp, 16), kntq: +e18(BigInt(l.data)).toFixed(6) });
   }
+  // Each burn (KNTQ sent from the treasury to a burn address), with its time, so the page can date the first one.
+  const knownBurns = new Map((prev?.burns || []).map(x => [x.tx + ':' + x.logIndex, x]));
+  const burns = [];
+  for (const l of kntqOut.filter(l => BURN_SINKS.includes('0x' + l.topics[2].slice(-40)))) {
+    const key = l.transactionHash + ':' + parseInt(l.logIndex, 16);
+    if (knownBurns.has(key)) { burns.push(knownBurns.get(key)); continue; }
+    const blk = await rpc('eth_getBlockByNumber', [l.blockNumber, false]);
+    burns.push({ tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16), time: parseInt(blk.timestamp, 16),
+                 to: '0x' + l.topics[2].slice(-40), kntq: +e18(BigInt(l.data)).toFixed(6) });
+  }
   return { address: treasury, ppm, kntq: +e18(kntq).toFixed(6),
            kntqReceived: +e18(received).toFixed(6), kntqFromBuybacks: +e18(received - fromSplitter - other).toFixed(6),
            kntqFromSplitter: +e18(fromSplitter).toFixed(6), kntqFromOther: +e18(other).toFixed(6), whype: +e18(whype).toFixed(6), usdc: Number(usdc) / 1e6,
-           kntqFees, kntqBurned: +e18(burned).toFixed(6), kntqMovedOut: +e18(movedOut).toFixed(6), buybacks, atBlock: N };
+           kntqFees, kntqBurned: +e18(burned).toFixed(6), burns, kntqMovedOut: +e18(movedOut).toFixed(6), buybacks, atBlock: N };
 }
 
 async function hyperliquid(prev) {
