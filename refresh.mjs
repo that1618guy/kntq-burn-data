@@ -555,7 +555,7 @@ async function projects(prev, kq) {
   const sumPaid = bs => bs.reduce((o, b) => { for (const [k, v] of Object.entries(b.paid)) o[k] = +((o[k] || 0) + v).toFixed(6); return o; }, {});
   const list = [...ours.map(p => ({ ...p, source: p.source || 'ours' })), ...added.values()].map(p => {
     const ws = wallets.filter(w => w.app === p.name), buys = ws.flatMap(w => w.buys), burns = ws.flatMap(w => w.burns);
-    const row = { name: p.name, commitment: p.commitment, kinetiq: p.kinetiq || null, chain: p.chain || null, source: p.source, kind: p.kind === 'buy' ? 'buy' : 'burn', note: p.note || null, wallets: ws.length };
+    const row = { name: p.name, commitment: p.commitment, kinetiq: p.kinetiq || null, chain: p.chain || null, source: p.source, kind: p.kind === 'buy' || p.kind === 'spend' ? p.kind : 'burn', note: p.note || null, wallets: ws.length };
     if (ws.length) Object.assign(row, { verified: true, complete: ws.every(w => w.complete && !w.error),
       bought: +buys.reduce((s, b) => s + b.kntq, 0).toFixed(6), paid: sumPaid(buys), burned: +burns.reduce((s, b) => s + b.kntq, 0).toFixed(6),
       buys: buys.length, lastBuy: buys.length ? Math.max(...buys.map(b => b.time)) : null,
@@ -565,6 +565,41 @@ async function projects(prev, kq) {
   return { list, added: [...added.values()], wallets, alerted: [...alerted], alerts, atBlock: N };
 }
 const pj = await step('projects', () => projects(prev?.projects, data.kinetiq)); if (pj) data.projects = { ...pj, at: now };
+/* Montra on Elysium. Its pools earn fees in KNTQ; its buyback contract swaps that KNTQ for MONTRA in Montra's pool
+   manager and the MONTRA is burned in the same transaction. So Montra spends KNTQ: the page shows it as a project
+   row and never adds it to bought, queued or burned. Addresses are read from Montra's on-chain registry every run.
+   Totals are kept in wei and grow from a block cursor; a changed registry address starts the count again from 0. */
+const MONTRA_REGISTRY = '0xf1e2fa75422f889e565f3142bdbf60b28dce2aa7';
+async function logsRange(address, topics, from, to) {
+  try { return await rpc('eth_getLogs', [{ fromBlock: hex(from), toBlock: hex(to), address, topics }]); }
+  catch (e) { if (to - from < 1000) throw e; const m = Math.floor((from + to) / 2);      // too wide: halve, never skip
+              return [...await logsRange(address, topics, from, m), ...await logsRange(address, topics, m + 1, to)]; }
+}
+async function montra(prev) {
+  const reg = async k => '0x' + (await rpc('eth_call', [{ to: MONTRA_REGISTRY, data: '0x8eaa6ac0' + Buffer.from(k).toString('hex').padEnd(64, '0') }, 'latest'])).slice(-40);
+  const filler = await reg('buybackFiller'), token = await reg('montra');
+  if (filler === ZERO || token === ZERO) throw new Error('Montra registry returned the zero address');
+  const N = parseInt(await rpc('eth_blockNumber', []), 16);
+  const keep = prev && prev.filler === filler && prev.token === token && Number.isInteger(prev.atBlock);
+  const from = keep ? prev.atBlock + 1 : 0;
+  // KNTQ leaving the buyback contract (into the pool), and MONTRA sent to the zero address, both since the cursor.
+  // A swap and its burn are in one transaction, so one block range always holds both.
+  const spent = await logsRange(KNTQ_EVM, [TRANSFER, pad32(filler)], from, N);
+  const burns = await logsRange(token, [TRANSFER, null, pad32(ZERO)], from, N);
+  const byTx = new Map();
+  for (const l of spent) { const x = byTx.get(l.transactionHash) || { tx: l.transactionHash, block: parseInt(l.blockNumber, 16), kntq: 0n, montra: 0n }; x.kntq += BigInt(l.data); byTx.set(l.transactionHash, x); }
+  for (const l of burns) { const x = byTx.get(l.transactionHash); if (x) x.montra += BigInt(l.data); }   // only burns from a KNTQ buyback
+  const buys = [...byTx.values()].sort((a, b) => a.block - b.block);
+  const kntqWei = BigInt(keep ? prev.kntqSpentWei : 0) + buys.reduce((a, x) => a + x.kntq, 0n);
+  const montraWei = BigInt(keep ? prev.montraBurnedWei : 0) + buys.reduce((a, x) => a + x.montra, 0n);
+  let last = keep ? prev.lastBuy : null;
+  if (buys.length) { const x = buys[buys.length - 1], blk = await rpc('eth_getBlockByNumber', [hex(x.block), false]);
+    last = { tx: x.tx, block: x.block, time: parseInt(blk.timestamp, 16), kntq: +e18(x.kntq).toFixed(6), montra: +e18(x.montra).toFixed(6) }; }
+  return { registry: MONTRA_REGISTRY, filler, token, kntqSpentWei: kntqWei.toString(), montraBurnedWei: montraWei.toString(),
+           kntqSpent: +e18(kntqWei).toFixed(6), montraBurned: +e18(montraWei).toFixed(6), buybacks: (keep ? prev.buybacks : 0) + buys.length,
+           lastBuy: last, counted: false, atBlock: N };
+}
+const mo = await step('montra', () => montra(prev?.montra)); if (mo) data.montra = { ...mo, at: now };
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns

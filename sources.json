@@ -61,6 +61,13 @@
       "commitment": "70% of its fee share, to NEST lockers, not burned",
       "kinetiq": "nest",
       "kind": "buy"
+    },
+    {
+      "name": "Montra",
+      "commitment": "Its pools' KNTQ fees go to MONTRA buybacks",
+      "kinetiq": "montra",
+      "chain": "montra",
+      "kind": "spend"
     }
   ],
   "apps": []
