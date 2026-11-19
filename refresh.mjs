@@ -17,6 +17,30 @@ const START   = process.env.START || '2026-11-05';          // first day charted
 const WINDOWS = +(process.env.WINDOWS || 3), WINDOW = +(process.env.WINDOW || 40); // exact check: 3 runs of 40 blocks a day
 const OUT     = new URL('./data.json', import.meta.url);
 const HL      = 'https://api.hyperliquid.xyz/info';
+/* Dollar value of a past buy: the typical price, (high + low + close) / 3, of the Hyperliquid 1-hour candle the buy
+   falls in, or of the nearest earlier hour that traded, up to 6 hours back. Candles are fetched in windows and cached
+   for the run; a buy's dollar value is stored with it once found, so it never moves with later prices. */
+const candleCache = new Map();
+async function hlInfo(body) {
+  for (let i = 0; ; i++) {
+    const r = await fetch(HL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
+    if (r.status === 429 && i < 6) { await sleep(2000 * (i + 1)); continue; }
+    if (!r.ok) throw new Error(`Hyperliquid ${body.type} HTTP ${r.status}`);
+    return r.json();
+  }
+}
+async function hourPx(coin, ms) {
+  if (!coin || !(ms > 0)) return null;
+  let m = candleCache.get(coin); if (!m) candleCache.set(coin, m = new Map());
+  const h = Math.floor(ms / 3600e3) * 3600e3;
+  if (!m.has(h)) {
+    const start = h - 6 * 3600e3, end = Math.min(Date.now(), h + 400 * 3600e3);
+    for (const c of await hlInfo({ type: 'candleSnapshot', req: { coin, interval: '1h', startTime: start, endTime: end } })) m.set(c.t, (+c.h + +c.l + +c.c) / 3);
+    for (let t = start; t <= end; t += 3600e3) if (!m.has(t)) m.set(t, null);    // fetched, no trade that hour
+  }
+  for (let k = 0; k <= 6; k++) { const v = m.get(h - k * 3600e3); if (v != null) return v; }
+  return null;
+}
 const AF      = '0xfefefefefefefefefefefefefefefefefefefefe'; // Hyperliquid Assistance Fund
 const LLAMA   = 'https://api.llama.fi/summary/fees/ascend-launchpad?dataType=dailyHoldersRevenue';
 const OWNER_PUBLIC = '0x000000000000000000000000000000000000006b';
@@ -344,6 +368,27 @@ if (hl) {
     history: hl.afKntq == null ? hist : [...hist, { date: now.slice(0, 10), kntq: hl.afKntq }].slice(-400),
   };
 }
+/* Dollars spent on each Ascend buy (both treasuries), at the hour of the buy: USDC at $1, WHYPE and HYPE at that
+   hour's HYPE price. A buy that cannot be priced keeps usd null, is left out of spentUsd and is warned about. */
+async function priceAscendBuys(blk, hypePair) {
+  if (!blk?.buybacks) return;
+  blk.warnings = (blk.warnings || []).filter(w => !w.price);
+  for (const b of blk.buybacks) {
+    if (b.usd == null) {
+      let usd = 0, missing = !!b.unpriced;
+      for (const [sym, amt] of Object.entries(b.paid || { WHYPE: b.whype })) {
+        if (sym === 'USDC') usd += amt;
+        else if (sym === 'WHYPE' || sym === 'HYPE') { const p = await hourPx(hypePair, b.time * 1000); if (p == null) missing = true; else usd += amt * p; }
+        else missing = true;
+      }
+      b.usd = missing ? null : +usd.toFixed(2);
+    }
+    if (b.usd == null) blk.warnings.push({ tx: b.tx, price: true, what: 'buy could not be valued in dollars; its KNTQ is counted, its cost is left out of spentUsd' });
+  }
+  blk.spentUsd = +blk.buybacks.reduce((a, b) => a + (b.usd || 0), 0).toFixed(2);
+  blk.unpricedBuys = blk.buybacks.filter(b => b.usd == null).length;
+}
+await step('priceAscendBuys', async () => { for (const k of ['ascendTreasury', 'ascendStrategic']) await priceAscendBuys(data[k], data.prices?.hypePair); });
 /* ---------- Burns ----------
    Burned = every KNTQ burned on Elysium, from any sender, plus KNTQ that reaches Hyperliquid's Assistance Fund
    when it traces back to the sequencer or an Elysium app.
@@ -639,38 +684,44 @@ async function logsRange(address, topics, from, to) {
   catch (e) { if (to - from < 1000) throw e; const m = Math.floor((from + to) / 2);      // too wide: halve, never skip
               return [...await logsRange(address, topics, from, m), ...await logsRange(address, topics, m + 1, to)]; }
 }
-async function montra(prev) {
+async function montra(prev, kntqPair) {
   const reg = async k => '0x' + (await rpc('eth_call', [{ to: MONTRA_REGISTRY, data: '0x8eaa6ac0' + Buffer.from(k).toString('hex').padEnd(64, '0') }, 'latest'])).slice(-40);
   const filler = await reg('buybackFiller'), token = await reg('montra');
   if (filler === ZERO || token === ZERO) throw new Error('Montra registry returned the zero address');
   const N = parseInt(await rpc('eth_blockNumber', []), 16);
-  const keep = prev && prev.filler === filler && prev.token === token && Number.isInteger(prev.atBlock);
+  const keep = prev && prev.filler === filler && prev.token === token && Number.isInteger(prev.atBlock) && prev.spentUsd != null;
   const from = keep ? prev.atBlock + 1 : 0;
   // KNTQ leaving the buyback contract (into the pool), and MONTRA sent to the zero address, both since the cursor.
   // A swap and its burn are in one transaction, so one block range always holds both.
   const spent = await logsRange(KNTQ_EVM, [TRANSFER, pad32(filler)], from, N);
   const burns = await logsRange(token, [TRANSFER, null, pad32(ZERO)], from, N);
   const byTx = new Map();
-  for (const l of spent) { const x = byTx.get(l.transactionHash) || { tx: l.transactionHash, block: parseInt(l.blockNumber, 16), kntq: 0n, montra: 0n }; x.kntq += BigInt(l.data); byTx.set(l.transactionHash, x); }
+  for (const l of spent) { const x = byTx.get(l.transactionHash) || { tx: l.transactionHash, block: parseInt(l.blockNumber, 16), time: l.blockTimestamp ? parseInt(l.blockTimestamp, 16) : null, kntq: 0n, montra: 0n }; x.kntq += BigInt(l.data); byTx.set(l.transactionHash, x); }
   for (const l of burns) { const x = byTx.get(l.transactionHash); if (x) x.montra += BigInt(l.data); }   // only burns from a KNTQ buyback
   const buys = [...byTx.values()].sort((a, b) => a.block - b.block);
   const kntqWei = BigInt(keep ? prev.kntqSpentWei : 0) + buys.reduce((a, x) => a + x.kntq, 0n);
   const montraWei = BigInt(keep ? prev.montraBurnedWei : 0) + buys.reduce((a, x) => a + x.montra, 0n);
+  // each buy's KNTQ in dollars at the hour it was spent (logs carry the block time)
+  let usdNew = 0, unpricedNew = 0;
+  for (const x of buys) { const p = x.time ? await hourPx(kntqPair, x.time * 1000) : null; if (p == null) unpricedNew++; else usdNew += e18(x.kntq) * p; }
+  const spentUsd = +((keep ? prev.spentUsd : 0) + usdNew).toFixed(2), unpricedBuys = (keep ? prev.unpricedBuys || 0 : 0) + unpricedNew;
+  if (unpricedNew) log('WARNING montra:', unpricedNew, 'buys could not be valued in dollars');
   let last = keep ? prev.lastBuy : null;
   if (buys.length) { const x = buys[buys.length - 1], blk = await rpc('eth_getBlockByNumber', [hex(x.block), false]);
     last = { tx: x.tx, block: x.block, time: parseInt(blk.timestamp, 16), kntq: +e18(x.kntq).toFixed(6), montra: +e18(x.montra).toFixed(6) }; }
   return { registry: MONTRA_REGISTRY, filler, token, kntqSpentWei: kntqWei.toString(), montraBurnedWei: montraWei.toString(),
            kntqSpent: +e18(kntqWei).toFixed(6), montraBurned: +e18(montraWei).toFixed(6), buybacks: (keep ? prev.buybacks : 0) + buys.length,
+           spentUsd, unpricedBuys, warnings: unpricedBuys ? [{ what: `${unpricedBuys} buys could not be valued in dollars; their KNTQ is counted, their value is left out of spentUsd` }] : [],
            lastBuy: last, counted: false, atBlock: N };
 }
-const mo = await step('montra', () => montra(prev?.montra)); if (mo) data.montra = { ...mo, at: now };
+const mo = await step('montra', () => montra(prev?.montra, data.prices?.kntqPair)); if (mo) data.montra = { ...mo, at: now };
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
-data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic]]
+data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic], ['montra', data.montra]]
   .flatMap(([k, v]) => (v?.warnings || []).map(w => ({ step: k, ...w })));
 await writeFile(OUT, JSON.stringify(data));
 log('wrote data.json', Object.keys(data.errors).length ? 'with errors: ' + Object.keys(data.errors).join(', ') : 'clean', data.warnings.length ? `(${data.warnings.length} warnings)` : '');
