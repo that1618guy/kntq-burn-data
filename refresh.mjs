@@ -123,7 +123,14 @@ async function sequencer(prev) {
     if (ex) ex.roles.push(role); else accounts.push({ address: now, roles: [role], from: hi });
     log(`${role} fee account is now ${now}, from block ${hi}`);
   }
-  for (const a of accounts) a.contract = (await rpc('eth_getCode', [a.address, 'latest'])).length > 2;
+  for (const a of accounts) {
+    a.contract = (await rpc('eth_getCode', [a.address, 'latest'])).length > 2;
+    if (!a.contract) continue;
+    // its owner, as the parent-chain address (an L1 sender appears on Elysium offset by Arbitrum's alias)
+    try { const o = BigInt('0x' + (await rpc('eth_call', [{ to: a.address, data: '0x8da5cb5b' }, 'latest'])).slice(-40));
+          a.owner = '0x' + o.toString(16).padStart(40, '0');
+          a.ownerParent = '0x' + ((o - 0x1111000000000000000000000000000000001111n + (1n << 160n)) % (1n << 160n)).toString(16).padStart(40, '0'); } catch {}
+  }
   const FEE = await named('network', N);
 
   /* What each account paid out. A plain account pays only by sending its own transactions (found by bisecting its
@@ -529,21 +536,25 @@ async function knownSources(seq, tre, sweep) {
   for (const f of seq?.accounts || (seq?.feeAccount ? [{ address: seq.feeAccount }] : []))     // every account that has been a fee account
     add('elysium', f.address, 'Elysium sequencer fee account', 'sequencer');
   if (tre?.address) add('elysium', tre.address, "Ascend's burn treasury", 'app', { app: 'Ascend' });
+  const owners = new Set((seq?.accounts || []).map(a => a.ownerParent).filter(Boolean));
   // Sequencer fees moved out of the fee account: the wallets it paid, on Elysium; a plain wallet (no code) is the same
   // key on HyperEVM and Hyperliquid, so it is watched there too; withdrawal destinations are watched on the parent side.
   for (const w of sweep?.wallets || []) {
     add('elysium', w.address, 'Elysium sequencer fees, moved to ' + w.address.slice(0, 6) + '…' + w.address.slice(-4), 'sequencer');
     if (!w.contract) for (const c of ['hyperevm', 'hypercore']) add(c, w.address, 'Elysium sequencer fees, moved to ' + w.address.slice(0, 6) + '…' + w.address.slice(-4), 'sequencer');
     for (const d of w.withdrawals || []) for (const c of ['hyperevm', 'hypercore'])
-      if (!known.has(c + ':' + d.destination)) add(c, d.destination, 'Elysium sequencer fees, withdrawn to ' + d.destination.slice(0, 6) + '…' + d.destination.slice(-4), 'sequencer');
+      if (!owners.has(d.destination) && !known.has(c + ':' + d.destination)) add(c, d.destination, 'Elysium sequencer fees, withdrawn to ' + d.destination.slice(0, 6) + '…' + d.destination.slice(-4), 'sequencer');
   }
+  // The fee splitters' owner also receives a share, but it is the contract that controls Elysium's fees and may hold
+  // other money, so it is never credited: a burn or Assistance Fund send from it is listed for review instead.
+  const review = [...owners].map(a => ({ address: a, why: "owner of the sequencer's fee splitters; receives a share of fees" }));
   const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
   for (const a of file.apps || []) {
     if (!/^0x[0-9a-fA-F]{40}$/.test(a.address || '') || !['elysium', 'hypercore', 'hyperevm'].includes(a.chain)) throw new Error('sources.json: bad entry ' + JSON.stringify(a));
     add(a.chain, a.address, a.label || a.app, 'app', { app: a.app, evidence: a.evidence });
   }
   const hash = createHash('sha256').update(JSON.stringify({ list, tracer: TRACER_VERSION })).digest('hex').slice(0, 16);
-  return { known, list, hash };
+  return { known, list, hash, review };
 }
 
 async function burns(prev, K, af) {
@@ -600,6 +611,8 @@ async function burns(prev, K, af) {
     events.push({ ...e, source: a.credited ? a.credited.label : null, kind: a.credited ? a.credited.kind : null, reason: a.credited ? null : (a.unidentified || 'not traced yet: ' + a.error) });
   }
   events.sort((x, y) => x.block - y.block || x.logIndex - y.logIndex);
+  for (const e of events) if ((K.review || []).some(r => r.address === e.actor || r.address === e.from))   // never credited
+    Object.assign(e, { source: null, kind: null, reason: 'possible sequencer burn, needs review' });
   const sum = xs => +xs.reduce((t, e) => t + e.kntq, 0).toFixed(6);
   const credited = events.filter(e => e.source), other = events.filter(e => !e.source);
 
@@ -615,6 +628,13 @@ async function burns(prev, K, af) {
     }
     afSenders.push({ ...t, kntq: s.kntq, sends: s.sends });
   }
+  // From a review address: not credited (it stays under other burns), logged so a person can look at it.
+  const reviewSet = new Map((K.review || []).map(r => [r.address, r]));
+  const review = [
+    ...events.filter(e => reviewSet.has(e.actor) || reviewSet.has(e.from)).map(e => ({ chain: 'elysium', address: reviewSet.has(e.actor) ? e.actor : e.from, tx: e.tx, kntq: e.kntq, time: e.time })),
+    ...afSenders.filter(x => reviewSet.has(x.from)).map(x => ({ chain: 'hypercore', address: x.from, kntq: x.kntq, sends: x.sends, time: Math.floor((x.last || 0) / 1000) })),
+  ].map(r => ({ ...r, status: 'possible sequencer burn, needs review', why: reviewSet.get(r.address).why }));
+  for (const r of review) if (r.chain === 'hypercore') { const x = afSenders.find(y => y.from === r.address); if (x) { delete x.credited; x.unidentified = 'possible sequencer burn, needs review'; } }
   const afCredited = afSenders.filter(x => x.credited);
   const afKntq = +afCredited.reduce((t, x) => t + x.kntq, 0).toFixed(6);
 
@@ -634,7 +654,7 @@ async function burns(prev, K, af) {
     excluded: { withdrawals, withdrawnKntq: +withdrawnKntq.toFixed(6), gateway: '0x5dc84e4cb0f9082246e92a5585c5395592b1af1f', router: '0x61ebbc3a29f1970af2ce862ba9c5364832e14d17', event: WITHDRAWAL_INITIATED },
     burnAddresses: BURN_ADDRESSES, events, zeroChecked,
     actors: [...traced.values()].map(a => ({ actor: a.actor, credited: a.credited || null, unidentified: a.unidentified || null, error: a.error || null, tries: a.tries || 0 })),
-    registryHash: K.hash, known: K.list, alerted: [...alerted], alerts, atBlock: N,
+    registryHash: K.hash, known: K.list, review, reviewAddresses: K.review || [], alerted: [...alerted], alerts, atBlock: N,
   };
 }
 /* ---------- Kinetiq's own figures, cross-checked ----------
