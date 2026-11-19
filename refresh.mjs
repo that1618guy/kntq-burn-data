@@ -26,6 +26,7 @@ const WHYPE    = '0xba876237b0f021a6c6d852d6c26e107997cc5e81';
 const USDC     = '0xb47c4c8f73f009cc0c0d3f92b388d13e293f0b65';  // 6 decimals
 // Burn addresses on Elysium. The zero address is not one: KNTQ sent there is a bridge withdrawal to HyperEVM.
 const BURN_ADDRESSES = ['0x000000000000000000000000000000000000dead', '0xdead000000000000000042069420694206942069'];
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // The fee account receives each transaction's execution gas x price, tips included. The L1 data part
 // (gasUsedForL1 x price, nonzero before Nov 10) is paid toward posting to the parent chain, not to it.
@@ -140,18 +141,8 @@ async function ascendTreasury(prev) {
   const kntqIn = await logs(KNTQ_EVM, [TRANSFER, null, pad32(treasury)]);
   const burned = kntqOut.filter(l => BURN_ADDRESSES.includes('0x' + l.topics[2].slice(-40))).reduce((a, l) => a + BigInt(l.data), 0n);
   const movedOut = kntqOut.reduce((a, l) => a + BigInt(l.data), 0n);
-  // Buybacks: WHYPE leaving the treasury in a tx that returns KNTQ to it.
-  const known = new Map((prev?.buybacks || []).map(b => [b.tx, b]));
-  const buybacks = [];
-  for (const l of await logs(WHYPE, [TRANSFER, pad32(treasury)])) {
-    if (known.has(l.transactionHash)) { buybacks.push(known.get(l.transactionHash)); continue; }
-    const rc = await rpc('eth_getTransactionReceipt', [l.transactionHash]);
-    const back = rc.logs.filter(x => x.address.toLowerCase() === KNTQ_EVM && x.topics[0] === TRANSFER && x.topics[2] === pad32(treasury))
-                        .reduce((a, x) => a + BigInt(x.data), 0n);
-    const blk = await rpc('eth_getBlockByNumber', [l.blockNumber, false]);
-    buybacks.push({ tx: l.transactionHash, block: parseInt(l.blockNumber, 16), time: parseInt(blk.timestamp, 16),
-                    whype: +e18(BigInt(l.data)).toFixed(6), kntq: +e18(back).toFixed(6) });
-  }
+  // Buybacks: KNTQ arriving in a tx where the treasury pays with any token or native HYPE (see treasuryBuys).
+  const { buybacks, warnings } = await treasuryBuys(treasury, kntqIn, prev);
   // Everything the treasury holds came in one of two ways: its own WHYPE-for-KNTQ buybacks, or straight from the
   // splitter as KNTQ (the burn leg of fees from launch pools priced in KNTQ). Anything else is reported, not hidden.
   const bbTx = new Set(buybacks.map(b => b.tx)), sum = ls => ls.reduce((a, l) => a + BigInt(l.data), 0n);
@@ -180,7 +171,77 @@ async function ascendTreasury(prev) {
   return { address: treasury, ppm, kntq: +e18(kntq).toFixed(6),
            kntqReceived: +e18(received).toFixed(6), kntqFromBuybacks: +e18(received - fromSplitter - other).toFixed(6),
            kntqFromSplitter: +e18(fromSplitter).toFixed(6), kntqFromOther: +e18(other).toFixed(6), whype: +e18(whype).toFixed(6), usdc: Number(usdc) / 1e6,
-           kntqFees, kntqBurned: +e18(burned).toFixed(6), burns, kntqMovedOut: +e18(movedOut).toFixed(6), buybacks, atBlock: N };
+           kntqFees, kntqBurned: +e18(burned).toFixed(6), burns, kntqMovedOut: +e18(movedOut).toFixed(6), buybacks, warnings, atBlock: N };
+}
+
+/* A buyback by an Ascend treasury is a transaction in which KNTQ arrives (from anyone but the splitter) and the treasury
+   pays: any ERC-20 leaving it, or native HYPE (no log, so read as its balance drop over that block). WHYPE and native
+   HYPE are priced as HYPE and USDC as dollars; any other token is still counted, by its KNTQ, and logged as a warning.
+   KNTQ arriving with no payment is not a buy and stays under "other". Each tx is read once and cached by hash. */
+const PAY_META = new Map([[WHYPE, { symbol: 'WHYPE', decimals: 18, priced: 'HYPE' }], [USDC, { symbol: 'USDC', decimals: 6, priced: 'USD' }]]);
+async function payToken(addr) {
+  if (PAY_META.has(addr)) return PAY_META.get(addr);
+  let m = { symbol: addr, decimals: null, priced: null };
+  try { const d = await rpc('eth_call', [{ to: addr, data: '0x313ce567' }, 'latest']); if (d && d !== '0x') m.decimals = Number(BigInt(d)); } catch {}
+  try { const r = await rpc('eth_call', [{ to: addr, data: '0x95d89b41' }, 'latest']); const n = parseInt(r.slice(66, 130), 16);
+        const sym = Buffer.from(r.slice(130, 130 + n * 2), 'hex').toString('utf8'); if (sym) m.symbol = sym; } catch {}
+  PAY_META.set(addr, m); return m;
+}
+async function treasuryBuys(treasury, kntqIn, prev) {
+  const known = new Map((prev?.buybacks || []).filter(b => b.paid).map(b => [b.tx, b]));   // older rows lack paid: re-read once
+  const txs = [...new Set(kntqIn.filter(l => '0x' + l.topics[1].slice(-40) !== SPLITTER).map(l => l.transactionHash))];
+  const buybacks = [], warnings = [];
+  for (const h of txs) {
+    let b = known.get(h);
+    if (!b) {
+      const rc = await rpc('eth_getTransactionReceipt', [h]);
+      if (rc.status !== '0x1') continue;
+      const T = rc.logs.filter(x => x.topics[0] === TRANSFER && x.topics.length === 3);
+      const back = T.filter(x => x.address.toLowerCase() === KNTQ_EVM && x.topics[2] === pad32(treasury)).reduce((a, x) => a + BigInt(x.data), 0n);
+      const paid = {}, unpriced = [];
+      for (const x of T.filter(x => x.topics[1] === pad32(treasury) && x.address.toLowerCase() !== KNTQ_EVM)) {
+        const tok = x.address.toLowerCase(), m = await payToken(tok);
+        if (m.decimals == null) { unpriced.push({ token: tok, symbol: m.symbol, raw: BigInt(x.data).toString(), why: 'decimals unreadable' }); continue; }
+        paid[m.symbol] = +((paid[m.symbol] || 0) + Number(BigInt(x.data)) / 10 ** m.decimals).toFixed(6);
+        if (!m.priced) unpriced.push({ token: tok, symbol: m.symbol, why: 'no price source' });
+      }
+      const blkN = parseInt(rc.blockNumber, 16);
+      if (!Object.keys(paid).length && !unpriced.length) {            // no token left: native HYPE, or not a buy at all
+        const drop = await balanceAt(treasury, blkN - 1) - await balanceAt(treasury, blkN);
+        if (drop > 0n) paid.HYPE = +e18(drop).toFixed(6);
+      }
+      if (!Object.keys(paid).length && !unpriced.length) continue;   // KNTQ arrived with no payment: not a buy
+      const blk = await rpc('eth_getBlockByNumber', [rc.blockNumber, false]);
+      b = { tx: h, block: blkN, time: parseInt(blk.timestamp, 16), kntq: +e18(back).toFixed(6), whype: paid.WHYPE || 0, paid };
+      if (unpriced.length) b.unpriced = unpriced;
+    }
+    if (b.unpriced) warnings.push({ tx: b.tx, what: `buy paid with a token the page cannot price (${b.unpriced.map(u => u.symbol).join(', ')}); its KNTQ is counted` });
+    buybacks.push(b);
+  }
+  buybacks.sort((a, b) => a.block - b.block);
+  for (const w of warnings) log('WARNING', treasury, w.tx, w.what);
+  return { buybacks, warnings };
+}
+
+/* Ascend's strategic treasury: the splitter's other KNTQ leg (43.2%), bought and held for liquidity and rewards, never
+   burned. Read the same way as the burn treasury, kept in its own block so nothing adds it to queued or burned.
+   0xdcc81cb2 returns its address and 0x9dfa1b6e its share in ppm (names not published; checked 2026-11-19). */
+async function ascendStrategic(prev, burnTreasury) {
+  const N = parseInt(await rpc('eth_blockNumber', []), 16);
+  const address = '0x' + (await rpc('eth_call', [{ to: SPLITTER, data: '0xdcc81cb2' }, 'latest'])).slice(-40);
+  const ppm = Number(BigInt(await rpc('eth_call', [{ to: SPLITTER, data: '0x9dfa1b6e' }, 'latest'])));
+  if (address === ZERO_ADDR || address === burnTreasury) throw new Error(`splitter returned ${address} as the strategic treasury`);
+  if (ppm <= 0 || ppm >= 1e6) throw new Error(`strategic share ${ppm} ppm is not a share`);
+  const logs = async topics => rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: hex(N), address: KNTQ_EVM, topics }]);
+  const kntqIn = await logs([TRANSFER, null, pad32(address)]), kntqOut = await logs([TRANSFER, pad32(address)]);
+  const { buybacks, warnings } = await treasuryBuys(address, kntqIn, prev?.address === address ? prev : null);
+  const sum = ls => ls.reduce((a, l) => a + BigInt(l.data), 0n);
+  const bbTx = new Set(buybacks.map(b => b.tx));
+  const fromSplitter = sum(kntqIn.filter(l => !bbTx.has(l.transactionHash) && '0x' + l.topics[1].slice(-40) === SPLITTER));
+  const other = sum(kntqIn.filter(l => !bbTx.has(l.transactionHash) && '0x' + l.topics[1].slice(-40) !== SPLITTER));
+  return { address, ppm, kntq: +e18(await erc20Bal(KNTQ_EVM, address)).toFixed(6), bought: +buybacks.reduce((a, b) => a + b.kntq, 0).toFixed(6),
+           kntqFromSplitter: +e18(fromSplitter).toFixed(6), kntqFromOther: +e18(other).toFixed(6), kntqMovedOut: +e18(sum(kntqOut)).toFixed(6),
+           buybacks, warnings, counted: false, atBlock: N };
 }
 
 async function hyperliquid(prev) {
@@ -267,6 +328,7 @@ const step = async (name, fn) => { try { return await fn(); } catch (e) { log(`$
 const seq = await step('sequencer', () => sequencer(prev?.sequencer));        if (seq) data.sequencer = { ...seq, at: now };
 const asc = await step('ascend', ascendUsd);                                   if (asc && asc.length) data.ascend = { ...(data.ascend || {}), days: asc, at: now };
 const tre = await step('ascendTreasury', () => ascendTreasury(prev?.ascendTreasury)); if (tre) data.ascendTreasury = { ...tre, at: now };
+const strat = await step('ascendStrategic', () => ascendStrategic(prev?.ascendStrategic, data.ascendTreasury?.address)); if (strat) data.ascendStrategic = { ...strat, at: now };
 const RECENT = 60, WINDOW_MS = 8 * 86400e3;
 const hl  = await step('hyperliquid', () => hyperliquid(prev?.assistanceFund));
 if (hl) {
@@ -406,7 +468,7 @@ async function burns(prev, K, af) {
 const KINETIQ = 'https://kinetiq.xyz/api/kntq-data/';
 const HYPEREVM = 'https://rpc.hyperliquid.xyz/evm';
 const SKNTQ = '0x696238e0ca31c94e24ca4cbe7921754e172e4d0f';   // Staked KNTQ (ERC-4626 vault) on HyperEVM
-async function kinetiq(tre, afKntq) {
+async function kinetiq(tre, afKntq, strat) {
   const get = async path => { const r = await fetch(KINETIQ + path, { headers: { 'user-agent': 'stateofblocks-kntq-burn' }, signal: AbortSignal.timeout(30000) });
     if (!r.ok) throw new Error(`${path} HTTP ${r.status}`); return r.json(); };
   const num = (v, what) => { const n = typeof v === 'string' ? +v : v; if (typeof n !== 'number' || !Number.isFinite(n)) throw new Error(`${what} is not a number`); return n; };
@@ -424,11 +486,13 @@ async function kinetiq(tre, afKntq) {
       bought: tracked ? num(t.kntqAmount, p.slug + ' bought') : null, spentUsd: tracked ? num(t.usdValue, p.slug + ' spent') : null,
       burned: tracked ? num(t.burnedKntqAmount, p.slug + ' burned') : null, lastBuy: tracked ? (t.lastTime ?? null) : null,
       days: Array.isArray(p.days) ? p.days.length : null };
-    // Cross-check where the chain has an address for the project. Only Ascend has one today: its burn treasury.
-    if (p.slug === 'ascend' && tre) {
-      const chain = { bought: tre.kntqFromBuybacks, burned: tre.kntqBurned, buys: tre.buybacks?.length ?? null, lastBuy: tre.buybacks?.length ? tre.buybacks[tre.buybacks.length - 1].time * 1000 : null };
+    // Cross-check where the chain has an address for the project. Ascend: Kinetiq counts the buys of both its burn
+    // treasury and its strategic treasury, so the chain figure is the two together.
+    if (p.slug === 'ascend' && tre && strat) {
+      const all = [...(tre.buybacks || []), ...(strat.buybacks || [])];
+      const chain = { bought: +(tre.kntqFromBuybacks + strat.bought).toFixed(6), burned: tre.kntqBurned, buys: all.length, lastBuy: all.length ? Math.max(...all.map(b => b.time)) * 1000 : null };
       const ok = tracked && close(row.bought, chain.bought, 1) && close(row.burned, chain.burned, 1);
-      row.check = { status: ok ? 'match' : 'mismatch', chain, against: `Ascend's burn treasury ${tre.address} on Elysium` };
+      row.check = { status: ok ? 'match' : 'mismatch', chain, against: `Ascend's burn treasury ${tre.address} and strategic treasury ${strat.address} on Elysium` };
     } else row.check = { status: 'no address', note: 'No wallet or burn address for this project is known, so the chain cannot confirm or contradict the figure.' };
     return row;
   });
@@ -441,7 +505,7 @@ async function kinetiq(tre, afKntq) {
               burned: afKntq == null ? 'unchecked' : close(supply.burned, afKntq, afKntq * 0.005) ? 'match' : 'mismatch', burnedDiff: afKntq == null ? null : +(supply.burned - afKntq).toFixed(2) },
   };
 }
-const kq = await step('kinetiq', () => kinetiq(data.ascendTreasury, data.assistanceFund?.kntq)); if (kq) data.kinetiq = { ...kq, at: now };
+const kq = await step('kinetiq', () => kinetiq(data.ascendTreasury, data.assistanceFund?.kntq, data.ascendStrategic)); if (kq) data.kinetiq = { ...kq, at: now };
 /* ---------- Projects buying KNTQ ----------
    The table is sources.json's projects list. Two things are added here:
    1. A project in Kinetiq's "projects buying KNTQ" data that is not in the list is added as pledged, not verifiable,
@@ -606,5 +670,7 @@ delete data.elysiumBurns;                           // the previous format; the 
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
+data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic]]
+  .flatMap(([k, v]) => (v?.warnings || []).map(w => ({ step: k, ...w })));
 await writeFile(OUT, JSON.stringify(data));
-log('wrote data.json', Object.keys(data.errors).length ? 'with errors: ' + Object.keys(data.errors).join(', ') : 'clean');
+log('wrote data.json', Object.keys(data.errors).length ? 'with errors: ' + Object.keys(data.errors).join(', ') : 'clean', data.warnings.length ? `(${data.warnings.length} warnings)` : '');

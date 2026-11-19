@@ -16,6 +16,13 @@
       "chain": "ascend"
     },
     {
+      "name": "Ascend strategic treasury",
+      "commitment": "43.2% of its protocol share, to a strategic treasury",
+      "kinetiq": null,
+      "chain": "ascend-strategic",
+      "kind": "buy"
+    },
+    {
       "name": "Oku",
       "commitment": "40% of net Elysium trading fees",
       "kinetiq": "oku"
@@ -52,7 +59,7 @@
     },
     {
       "name": "Markets.xyz",
-      "commitment": "100% of Kinetiq's disposable Markets income, to sKNTQ stakers, not burned",
+      "commitment": "Kinetiq credits Markets.xyz with a share of Assistance Fund deposits. Already counted in total burned. Runs on Hyperliquid, not Elysium.",
       "kinetiq": "marketsxyz",
       "kind": "buy"
     },
