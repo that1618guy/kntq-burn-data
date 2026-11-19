@@ -59,15 +59,17 @@
     },
     {
       "name": "Markets.xyz",
-      "commitment": "Kinetiq credits Markets.xyz with a share of Assistance Fund deposits. Already counted in total burned. Runs on Hyperliquid, not Elysium.",
+      "commitment": "100% of Kinetiq's disposable Markets income",
       "kinetiq": "marketsxyz",
-      "kind": "buy"
+      "kind": "buy",
+      "note": "Kinetiq credits Markets.xyz with a share of Assistance Fund deposits. Already counted in total burned. Runs on Hyperliquid, not Elysium."
     },
     {
       "name": "Nest",
-      "commitment": "70% of its fee share, to NEST lockers, not burned",
+      "commitment": "70% of its fee share",
       "kinetiq": "nest",
-      "kind": "buy"
+      "kind": "buy",
+      "note": "Goes to NEST lockers, not burned."
     },
     {
       "name": "Montra",
