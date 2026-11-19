@@ -51,6 +51,16 @@ const USDC     = '0xb47c4c8f73f009cc0c0d3f92b388d13e293f0b65';  // 6 decimals
 // Burn addresses on Elysium. The zero address is not one: KNTQ sent there is a bridge withdrawal to HyperEVM.
 const BURN_ADDRESSES = ['0x000000000000000000000000000000000000dead', '0xdead000000000000000042069420694206942069'];
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+const ARBSYS = '0x0000000000000000000000000000000000000064';
+const L2_TO_L1_TX = '0x3e7aafa77dbf186b7fd488006beff893744caa3c4f6f299e8a709fa2087374fc';   // ArbSys L2ToL1Tx
+// Arbitrum RewardDistributor (the fee splitters since 2026-11-19): a payout, a payout to the fallback, the recipients
+const RD_RECIPIENT = '0x8b2a2b28e169eb0e4f62578e9d12f747d7bd0fe1ebc935af28387c18034d7cc0';  // RecipientRecieved(address,uint256)
+const RD_FALLBACK  = '0x0fbda5308ce78c0e89ad38a55e04e9b2642b15c693b46ad9e3e6c35687a991b2';  // FallbackRecieved(address,address,uint256)
+const RD_OWNER     = '0xf3b03d863408466d72337e3dd8e40d5b9a37c5ef4c274f40dd3542d87697ab7e';  // OwnerRecieved(address,address,uint256), older builds
+const RD_RECIPIENTS = '0x33bc54b3c50e54df666d4399528026a4b04671bb2a879281b5279f7352fb3e6c'; // RecipientsUpdated(bytes32,address[],bytes32,uint256[])
+// withdrawals to the parent chain in a receipt: ArbSys L2ToL1Tx(caller, destination indexed, …, callvalue, data)
+const withdrawalsIn = rc => rc.logs.filter(l => l.address.toLowerCase() === ARBSYS && l.topics[0] === L2_TO_L1_TX)
+  .map(l => ({ by: '0x' + l.data.slice(26, 66), destination: '0x' + l.topics[1].slice(-40), hype: +e18(BigInt('0x' + l.data.slice(2 + 64 * 4, 2 + 64 * 5))).toFixed(9) }));
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // The fee account receives each transaction's execution gas x price, tips included. The L1 data part
 // (gasUsedForL1 x price, nonzero before Nov 10) is paid toward posting to the parent chain, not to it.
@@ -92,16 +102,88 @@ async function sequencer(prev) {
   const N = parseInt(latest.number, 16), T = parseInt(latest.timestamp, 16);
   log(`chain 99901 block ${N} @ ${new Date(T * 1000).toISOString()}`);
 
-  // The fee account is read from the chain every run, never assumed. Network and infra are one account today.
-  const network = '0x' + (await rpc('eth_call', [{ to: OWNER_PUBLIC, data: '0x2d9125e9' }, 'latest'])).slice(-40); // getNetworkFeeAccount()
-  const infra   = '0x' + (await rpc('eth_call', [{ to: OWNER_PUBLIC, data: '0xee95a824' }, 'latest'])).slice(-40); // getInfraFeeAccount()
-  if (network !== infra) throw new Error(`network (${network}) and infra (${infra}) fee accounts differ; the exact method needs both summed`);
-  if (prev?.feeAccount && prev.feeAccount !== network) throw new Error(`fee account changed ${prev.feeAccount} -> ${network}; re-derive history`);
-  const FEE = network;
-  // An account that has never sent a transaction (nonce 0) cannot have paid anything out, so its balance
-  // change over a day is everything it received that day. Once it sends (a buyback), outflows must be added back.
-  const nonce = parseInt(await rpc('eth_getTransactionCount', [FEE, 'latest']), 16);
-  const feeBalance = await balanceAt(FEE, N);
+  /* Fee accounts. ArbOwnerPublic names a network and an infra fee account; both are read every run. Until 2026-11-19
+     16:41 UTC both were one plain account (0x6cbb…9a05); then Elysium switched both to fee-splitter contracts
+     (Arbitrum RewardDistributor). Every account that has ever been a fee account is kept, with the block it started,
+     and the fees received over any range of blocks are, summed over all of them, the balance change plus what they
+     paid out in that range. An account no longer named only pays out, so its terms cancel and add nothing. */
+  const getter = { network: '0x2d9125e9', infra: '0xee95a824' };            // getNetworkFeeAccount(), getInfraFeeAccount()
+  const named = async (role, b) => '0x' + (await rpc('eth_call', [{ to: OWNER_PUBLIC, data: getter[role] }, hex(b)])).slice(-40);
+  const accounts = (prev?.accounts || (prev?.feeAccount ? [{ address: prev.feeAccount, roles: ['network', 'infra'], from: 0 }] : [])).map(a => ({ ...a }));
+  if (!accounts.length) for (const role of ['network', 'infra']) {                       // cold start: the genesis accounts
+    const g = await named(role, 1), ex = accounts.find(a => a.address === g);
+    if (ex) ex.roles.push(role); else accounts.push({ address: g, roles: [role], from: 0 });
+  }
+  for (const role of ['network', 'infra']) {
+    const now = await named(role, N);
+    if (accounts.some(a => a.address === now && a.roles.includes(role))) continue;
+    let lo = Math.max(0, ...accounts.filter(a => a.roles.includes(role)).map(a => a.from)), hi = N;   // first block naming it
+    while (hi - lo > 1) { const m = Math.floor((lo + hi) / 2); if ((await named(role, m)) === now) hi = m; else lo = m; }
+    const ex = accounts.find(a => a.address === now);
+    if (ex) ex.roles.push(role); else accounts.push({ address: now, roles: [role], from: hi });
+    log(`${role} fee account is now ${now}, from block ${hi}`);
+  }
+  for (const a of accounts) a.contract = (await rpc('eth_getCode', [a.address, 'latest'])).length > 2;
+  const FEE = await named('network', N);
+
+  /* What each account paid out. A plain account pays only by sending its own transactions (found by bisecting its
+     nonce, read once): each one's value and the gas it paid (the L2 part of that gas comes back as a fee, which
+     the balance shows). A splitter pays only in distributions, each logged with its amount. */
+  const prevOut = new Map((prev?.outflows || []).map(o => [o.account + ':' + (o.nonce ?? o.tx + ':' + o.logIndex), o]));
+  const outflows = [];
+  for (const a of accounts) {
+    if (!a.contract) {
+      const nonce = parseInt(await rpc('eth_getTransactionCount', [a.address, hex(N)]), 16);
+      const nonceAt = async b => parseInt(await rpc('eth_getTransactionCount', [a.address, hex(b)]), 16);
+      let lo = 0;
+      for (let n = 0; n < nonce; n++) {
+        let o = prevOut.get(a.address + ':' + n) || (n < (prev?.outflows || []).length && !prev?.accounts && a.address === prev?.feeAccount ? { ...(prev.outflows.find(x => x.nonce === n) || {}), account: a.address } : null);
+        if (!o || o.block == null) {
+          let hi = N;                                                     // first block after which nonce > n
+          while (hi - lo > 1) { const m = Math.floor((lo + hi) / 2); if (await nonceAt(m) > n) hi = m; else lo = m; }
+          const blk = await rpc('eth_getBlockByNumber', [hex(hi), true]);
+          const tx = blk.transactions.find(t => t.from.toLowerCase() === a.address && parseInt(t.nonce, 16) === n);
+          if (!tx) throw new Error(`transaction ${n} of ${a.address} not found in block ${hi}`);
+          const rc = await rpc('eth_getTransactionReceipt', [tx.hash]);
+          const valueWei = rc.status === '0x1' ? BigInt(tx.value) : 0n, gasWei = BigInt(rc.gasUsed) * BigInt(rc.effectiveGasPrice);
+          const to = (tx.to || '').toLowerCase();
+          o = { account: a.address, nonce: n, tx: tx.hash, block: hi, time: parseInt(blk.timestamp, 16), to, status: rc.status,
+                valueWei: valueWei.toString(), gasWei: gasWei.toString(), hype: +e18(valueWei + gasWei).toFixed(9), withdrawals: withdrawalsIn(rc) };
+          log(`${a.address} sent transaction ${n}: ${e18(valueWei).toFixed(4)} HYPE to ${to}`);
+        }
+        outflows.push(o); lo = o.block;
+      }
+    } else {
+      const logs = await rpc('eth_getLogs', [{ fromBlock: hex(a.from), toBlock: hex(N), address: a.address, topics: [[RD_RECIPIENT, RD_FALLBACK, RD_OWNER]] }]);
+      for (const l of logs) {
+        const key = a.address + ':' + l.transactionHash + ':' + parseInt(l.logIndex, 16);
+        let o = prevOut.get(key);
+        if (!o) {
+          const blk = await rpc('eth_getBlockByNumber', [l.blockNumber, false]), rc = await rpc('eth_getTransactionReceipt', [l.transactionHash]);
+          const valueWei = BigInt('0x' + l.data.slice(-64));
+          o = { account: a.address, tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: parseInt(l.blockNumber, 16), time: parseInt(blk.timestamp, 16),
+                to: '0x' + l.topics[l.topics.length - 1].slice(-40), status: '0x1', valueWei: valueWei.toString(), gasWei: '0', hype: +e18(valueWei).toFixed(9),
+                withdrawals: withdrawalsIn(rc), distribution: true };
+        }
+        outflows.push(o);
+      }
+    }
+  }
+  outflows.sort((x, y) => x.block - y.block || (x.logIndex ?? 0) - (y.logIndex ?? 0));
+  const outIn = (from, to) => outflows.filter(o => o.block >= from && o.block <= to).reduce((s, o) => s + BigInt(o.valueWei) + BigInt(o.gasWei), 0n);
+  const balAll = async b => { let s = 0n; for (const a of accounts) s += await balanceAt(a.address, b); return s; };
+  const nonce = parseInt(await rpc('eth_getTransactionCount', [accounts[0].address, hex(N)]), 16);   // the original account's
+  const feeBalance = await balAll(N);
+  // the recipients the splitters pay now (their latest RecipientsUpdated), watched with everything else they were paid
+  const recipients = [];
+  for (const a of accounts.filter(x => x.contract)) {
+    const ups = await rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: hex(N), address: a.address, topics: [RD_RECIPIENTS] }]);
+    if (!ups.length) continue;
+    const d = ups[ups.length - 1].data.slice(2), word = i => d.slice(i * 64, i * 64 + 64), at = off => parseInt(word(off / 32), 16);
+    const ro = at(32), wo = at(96), n = parseInt(d.slice(ro * 2, ro * 2 + 64), 16);
+    for (let i = 0; i < n; i++) recipients.push({ account: a.address, address: '0x' + d.slice(ro * 2 + 64 + i * 64, ro * 2 + 128 + i * 64).slice(-40),
+      bps: parseInt(d.slice(wo * 2 + 64 + i * 64, wo * 2 + 128 + i * 64), 16) });
+  }
 
   const bounds = { ...(prev?.bounds || {}) };              // UTC midnight (s) -> first block at/after it
   async function blockAt(ts) {
@@ -124,16 +206,16 @@ async function sequencer(prev) {
     const span = to - from + 1, w = Math.min(span, WINDOW), out = [];
     for (let i = 0; i < Math.min(WINDOWS, Math.ceil(span / w)); i++) {
       const a = from + Math.floor(Math.random() * (span - w + 1)), b = a + w - 1;
-      const delta = (await balanceAt(FEE, b)) - (await balanceAt(FEE, a - 1));
+      const delta = (await balAll(b)) - (await balAll(a - 1));
       let fees = 0n;
       for (let k = a; k <= b; k++) for (const r of (await rpc('eth_getBlockReceipts', [hex(k)])) || [])
         if (!NOT_SEQUENCER_FEE.has(r.type)) fees += (BigInt(r.gasUsed || '0x0') - BigInt(r.gasUsedForL1 || '0x0')) * BigInt(r.effectiveGasPrice || '0x0');
-      out.push({ from: a, to: b, feesWei: fees.toString(), deltaWei: delta.toString(), ok: fees === delta });
+      const sent = outIn(a, b);                                       // what it paid out inside the window
+      out.push({ from: a, to: b, feesWei: fees.toString(), deltaWei: delta.toString(), ...(sent ? { sentWei: sent.toString() } : {}), ok: fees === delta + sent });
     }
     return { windows: out, blocks: out.length * w, ok: out.every(x => x.ok) };
   }
 
-  if (nonce !== 0) log(`fee account nonce ${nonce}: it has sent transactions, so balance deltas undercount from then on`);
   const done = new Map((prev?.days || []).filter(d => !d.partial && d.check?.windows && d.method === 'fee-account-delta').map(d => [d.date, d]));
   const days = [];
   const today0 = Math.floor(T / 86400) * 86400;
@@ -142,17 +224,26 @@ async function sequencer(prev) {
     if (done.has(date)) { days.push(done.get(date)); continue; }
     const from = await blockAt(t), to = partial ? N : (await blockAt(t + 86400)) - 1;
     if (to < from) { days.push({ date, feesHype: 0, fromBlock: from, toBlock: to, partial, method: 'fee-account-delta', check: { windows: [], blocks: 0, ok: true } }); continue; }
-    if (nonce !== 0) { days.push({ date, feesHype: null, partial, method: 'fee-account-delta', error: 'fee account has sent transactions; outflows not yet reconstructed' }); continue; }
-    const wei = (await balanceAt(FEE, to)) - (await balanceAt(FEE, from - 1));
-    const row = { date, feesHype: +e18(wei).toFixed(9), fromBlock: from, toBlock: to, partial, method: 'fee-account-delta',
+    const sent = outIn(from, to);
+    const wei = (await balAll(to)) - (await balAll(from - 1)) + sent;
+    const row = { date, feesHype: +e18(wei).toFixed(9), fromBlock: from, toBlock: to, partial, method: 'fee-account-delta', ...(sent ? { sentHype: +e18(sent).toFixed(9) } : {}),
                   hours: +(((partial ? T : t + 86400) - t) / 3600).toFixed(2) };
     if (!partial) row.check = await windowCheck(from, to);
     days.push(row);
     log(`${date}${partial ? ' (so far)' : ''}: ${row.feesHype.toFixed(4)} HYPE in fees, blocks ${from}..${to}` +
         (row.check ? `, ${row.check.windows.length} windows ${row.check.ok ? 'exact' : 'MISMATCH ' + JSON.stringify(row.check.windows.filter(x => !x.ok))}` : ''));
   }
-  return { method: 'fee-account-delta', feeAccount: FEE, feeAccountNonce: nonce, feeAccountHype: +e18(feeBalance).toFixed(9),
-           buybacksExecuted: nonce === 0 ? 0 : null, latestBlock: N, latestTime: T, bounds, days };
+  // The last hour, the same way: balance change plus what was sent, from the first block an hour back.
+  let h0 = N - 1; { let lo = 1, hi = N; while (lo < hi) { const m = Math.floor((lo + hi) / 2); if (parseInt((await rpc('eth_getBlockByNumber', [hex(m), false])).timestamp, 16) < T - 3600) lo = m + 1; else hi = m; } h0 = lo; }
+  const hourWei = feeBalance - (await balAll(h0 - 1)) + outIn(h0, N);
+  const sentAll = outflows.reduce((a, o) => a + BigInt(o.valueWei) + BigInt(o.gasWei), 0n);
+  const cur = [FEE, await named('infra', N)];
+  return { method: 'fee-account-delta', feeAccount: FEE, accounts: await Promise.all(accounts.map(async a => ({ ...a, current: cur.includes(a.address), hype: +e18(await balanceAt(a.address, N)).toFixed(9) }))),
+           recipients, feeAccountNonce: nonce, feeAccountHype: +e18(feeBalance).toFixed(9),
+           // every fee the account has ever received: what it holds plus everything it has sent
+           feesAllTimeHype: +e18(feeBalance + sentAll).toFixed(9), sentHype: +e18(sentAll).toFixed(9), outflows,
+           lastHour: { hype: +e18(hourWei).toFixed(9), fromBlock: h0, toBlock: N, toTime: T },
+           buybacksExecuted: null, latestBlock: N, latestTime: T, bounds, days };
 }
 
 async function ascendTreasury(prev) {
@@ -389,6 +480,37 @@ async function priceAscendBuys(blk, hypePair) {
   blk.unpricedBuys = blk.buybacks.filter(b => b.usd == null).length;
 }
 await step('priceAscendBuys', async () => { for (const k of ['ascendTreasury', 'ascendStrategic']) await priceAscendBuys(data[k], data.prices?.hypePair); });
+
+/* Where the sequencer's fees went once they left the fee account (first on 2026-11-19). Every address the account paid
+   is watched: a KNTQ buy by one of them (KNTQ arriving in a transaction where it pays) is a sequencer buy, KNTQ it
+   holds is bought but not yet burned, and the refresh's attribution credits any burn or Assistance Fund deposit that
+   traces back to them to the sequencer (see knownSources). Withdrawals to the parent chain are listed with their
+   destinations, which are watched there too. Nothing here is set by hand: a new payment adds a new watched address. */
+async function sequencerSweep(seq, prev) {
+  const outs = (seq?.outflows || []).filter(o => o.status === '0x1' && BigInt(o.valueWei) > 0n);
+  const watch = [...new Set([...outs.map(o => o.to), ...(seq?.recipients || []).map(r => r.address)])];
+  const N = parseInt(await rpc('eth_blockNumber', []), 16);
+  const prevW = new Map((prev?.wallets || []).map(w => [w.address, w]));
+  const wallets = [], buys = [], tokenWarnings = [];
+  for (const a of watch) {
+    const kntqIn = await rpc('eth_getLogs', [{ fromBlock: '0x0', toBlock: hex(N), address: KNTQ_EVM, topics: [TRANSFER, null, pad32(a)] }]);
+    const pw = prevW.get(a), { buybacks, warnings } = await treasuryBuys(a, kntqIn, pw ? { buybacks: (prev?.buybacks || []).filter(b => b.wallet === a) } : null);
+    tokenWarnings.push(...warnings);
+    for (const b of buybacks) buys.push({ ...b, wallet: a });
+    const o = outs.filter(x => x.to === a), r = (seq?.recipients || []).filter(x => x.address === a);
+    wallets.push({ address: a, contract: (await rpc('eth_getCode', [a, 'latest'])).length > 2, bps: r.length ? r[0].bps : null,
+                   receivedHype: +o.reduce((t, x) => t + e18(BigInt(x.valueWei)), 0).toFixed(9), firstTime: o.length ? o[0].time : null,
+                   hype: +e18(await balanceAt(a, N)).toFixed(9), kntq: +e18(await erc20Bal(KNTQ_EVM, a)).toFixed(6),
+                   withdrawals: outs.flatMap(x => x.withdrawals || []).filter(w => w.by === a) });
+  }
+  const blk = { buybacks: buys.sort((x, y) => x.block - y.block), warnings: tokenWarnings };
+  await priceAscendBuys(blk, data.prices?.hypePair);
+  const hypeOf = b => (b.paid?.WHYPE || 0) + (b.paid?.HYPE || 0);
+  return { wallets, buybacks: blk.buybacks, spentHype: +blk.buybacks.reduce((t, b) => t + hypeOf(b), 0).toFixed(9),
+           boughtKntq: +blk.buybacks.reduce((t, b) => t + b.kntq, 0).toFixed(6), spentUsd: blk.spentUsd, unpricedBuys: blk.unpricedBuys,
+           heldKntq: +wallets.reduce((t, w) => t + w.kntq, 0).toFixed(6), warnings: blk.warnings, atBlock: N };
+}
+const sw = await step('sequencerSweep', () => sequencerSweep(data.sequencer, prev?.sequencerSweep)); if (sw) data.sequencerSweep = { ...sw, at: now };
 /* ---------- Burns ----------
    Burned = every KNTQ burned on Elysium, from any sender, plus KNTQ that reaches Hyperliquid's Assistance Fund
    when it traces back to the sequencer or an Elysium app.
@@ -401,11 +523,20 @@ const ZERO = '0x0000000000000000000000000000000000000000';
 const WITHDRAWAL_INITIATED = '0x3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73';
 const KNOWN_FILE = new URL('./sources.json', import.meta.url);
 
-async function knownSources(seq, tre) {
+async function knownSources(seq, tre, sweep) {
   const known = new Map(), list = [];
   const add = (chain, address, label, kind, extra = {}) => { const k = chain + ':' + address.toLowerCase(); known.set(k, { label, kind, ...extra }); list.push({ chain, address: address.toLowerCase(), label, kind, ...extra }); };
-  if (seq?.feeAccount) add('elysium', seq.feeAccount, 'Elysium sequencer fee account', 'sequencer');
+  for (const f of seq?.accounts || (seq?.feeAccount ? [{ address: seq.feeAccount }] : []))     // every account that has been a fee account
+    add('elysium', f.address, 'Elysium sequencer fee account', 'sequencer');
   if (tre?.address) add('elysium', tre.address, "Ascend's burn treasury", 'app', { app: 'Ascend' });
+  // Sequencer fees moved out of the fee account: the wallets it paid, on Elysium; a plain wallet (no code) is the same
+  // key on HyperEVM and Hyperliquid, so it is watched there too; withdrawal destinations are watched on the parent side.
+  for (const w of sweep?.wallets || []) {
+    add('elysium', w.address, 'Elysium sequencer fees, moved to ' + w.address.slice(0, 6) + '…' + w.address.slice(-4), 'sequencer');
+    if (!w.contract) for (const c of ['hyperevm', 'hypercore']) add(c, w.address, 'Elysium sequencer fees, moved to ' + w.address.slice(0, 6) + '…' + w.address.slice(-4), 'sequencer');
+    for (const d of w.withdrawals || []) for (const c of ['hyperevm', 'hypercore'])
+      if (!known.has(c + ':' + d.destination)) add(c, d.destination, 'Elysium sequencer fees, withdrawn to ' + d.destination.slice(0, 6) + '…' + d.destination.slice(-4), 'sequencer');
+  }
   const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
   for (const a of file.apps || []) {
     if (!/^0x[0-9a-fA-F]{40}$/.test(a.address || '') || !['elysium', 'hypercore', 'hyperevm'].includes(a.chain)) throw new Error('sources.json: bad entry ' + JSON.stringify(a));
@@ -715,13 +846,13 @@ async function montra(prev, kntqPair) {
            lastBuy: last, counted: false, atBlock: N };
 }
 const mo = await step('montra', () => montra(prev?.montra, data.prices?.kntqPair)); if (mo) data.montra = { ...mo, at: now };
-const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury));
+const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury, data.sequencerSweep));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
-data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic], ['montra', data.montra]]
+data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic], ['montra', data.montra], ['sequencerSweep', data.sequencerSweep]]
   .flatMap(([k, v]) => (v?.warnings || []).map(w => ({ step: k, ...w })));
 await writeFile(OUT, JSON.stringify(data));
 log('wrote data.json', Object.keys(data.errors).length ? 'with errors: ' + Object.keys(data.errors).join(', ') : 'clean', data.warnings.length ? `(${data.warnings.length} warnings)` : '');
