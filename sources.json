@@ -1,6 +1,6 @@
 {
   "about": "Confirmed app wallets for Elysium Terminal. A burn on Elysium, or KNTQ reaching Hyperliquid's Assistance Fund, is credited to 'the sequencer or apps' when it comes from one of these, or when every inflow of the wallet that sent it traces back to one within 3 hops. The sequencer fee account and Ascend's burn treasury are read from the chain on every refresh and are not listed here.",
-  "howToAdd": "Add an object to apps: address (0x...), chain (elysium, hypercore or hyperevm), app (its name), label (what the wallet is), evidence (a link where the app itself states this address), added (YYYY-MM-DD). Only add an address the app has published or confirmed.",
+  "howToAdd": "Add an object to apps: address (0x...), chain (elysium, hypercore or hyperevm), app (its name), label (what the wallet is), evidence (a link where the app itself states this address), added (YYYY-MM-DD). Only add an address the app has published or confirmed. Add counted: false for a project wallet that is shown in the projects table but never credited as the sequencer or apps (its burns stay out of queued and burned on Elysium).",
   "howToAddProject": "Add an object to projects: name, commitment (short, e.g. \"40% of net trading revenue\"), kinetiq (its slug in Kinetiq's projects-buying-KNTQ data, or null), and optionally note. A project is verified on chain once at least one of its wallets is listed under apps with app equal to its name; the next refresh then reads that wallet's whole history, not only what comes after. The Elysium sequencer and Ascend are read from the chain and need no wallet here. Set kind to \"buy\" for a project that buys KNTQ but does not burn it.",
   "projects": [
     {
@@ -77,7 +77,32 @@
       "kinetiq": "montra",
       "chain": "montra",
       "kind": "spend"
+    },
+    {
+      "name": "Tesera",
+      "commitment": "Weekly buybacks of its fees, held in treasury",
+      "kinetiq": "tesera-lab",
+      "kind": "buy"
     }
   ],
-  "apps": []
+  "apps": [
+    {
+      "address": "0x0f4d74359142dcb648d9ce7d2d01f247ce4f9bfa",
+      "chain": "elysium",
+      "app": "Tesera",
+      "label": "Tesera's treasury",
+      "evidence": "Given by the State of Blocks editor 2026-11-20; first buyback tx 0x378687be93857677920bea1e9cd986b2654057c60dd0baadce33a6c0f323a909 (Elysium) pays from this address",
+      "added": "2026-11-20",
+      "counted": false
+    },
+    {
+      "address": "0x0f4d74359142dcb648d9ce7d2d01f247ce4f9bfa",
+      "chain": "hypercore",
+      "app": "Tesera",
+      "label": "Tesera's treasury",
+      "evidence": "Given by the State of Blocks editor 2026-11-20; first buyback tx 0x378687be93857677920bea1e9cd986b2654057c60dd0baadce33a6c0f323a909 (Elysium) pays from this address",
+      "added": "2026-11-20",
+      "counted": false
+    }
+  ]
 }

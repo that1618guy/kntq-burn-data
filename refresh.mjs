@@ -549,12 +549,16 @@ async function knownSources(seq, tre, sweep) {
   // other money, so it is never credited: a burn or Assistance Fund send from it is listed for review instead.
   const review = [...owners].map(a => ({ address: a, why: "owner of the sequencer's fee splitters; receives a share of fees" }));
   const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
+  // A wallet with counted: false (a project that buys and holds, e.g. Tesera) is shown in the projects table only: it is
+  // never a source, so its burns and Assistance Fund sends stay out of the sequencer-or-apps figures.
+  const projectOnly = new Map();
   for (const a of file.apps || []) {
     if (!/^0x[0-9a-fA-F]{40}$/.test(a.address || '') || !['elysium', 'hypercore', 'hyperevm'].includes(a.chain)) throw new Error('sources.json: bad entry ' + JSON.stringify(a));
+    if (a.counted === false) { projectOnly.set(a.chain + ':' + a.address.toLowerCase(), a.app); continue; }
     add(a.chain, a.address, a.label || a.app, 'app', { app: a.app, evidence: a.evidence });
   }
   const hash = createHash('sha256').update(JSON.stringify({ list, tracer: TRACER_VERSION })).digest('hex').slice(0, 16);
-  return { known, list, hash, review };
+  return { known, list, hash, review, projectOnly };
 }
 
 async function burns(prev, K, af) {
@@ -613,6 +617,8 @@ async function burns(prev, K, af) {
   events.sort((x, y) => x.block - y.block || x.logIndex - y.logIndex);
   for (const e of events) if ((K.review || []).some(r => r.address === e.actor || r.address === e.from))   // never credited
     Object.assign(e, { source: null, kind: null, reason: 'possible sequencer burn, needs review' });
+  const PO = K.projectOnly || new Map(), poReason = app => `${app}'s treasury: in the projects table, not counted as the sequencer or apps`;
+  for (const e of events) { const app = PO.get('elysium:' + e.from) || PO.get('elysium:' + e.actor); if (app) Object.assign(e, { source: null, kind: null, reason: poReason(app), project: app }); }
   const sum = xs => +xs.reduce((t, e) => t + e.kntq, 0).toFixed(6);
   const credited = events.filter(e => e.source), other = events.filter(e => !e.source);
 
@@ -635,6 +641,7 @@ async function burns(prev, K, af) {
     ...afSenders.filter(x => reviewSet.has(x.from)).map(x => ({ chain: 'hypercore', address: x.from, kntq: x.kntq, sends: x.sends, time: Math.floor((x.last || 0) / 1000) })),
   ].map(r => ({ ...r, status: 'possible sequencer burn, needs review', why: reviewSet.get(r.address).why }));
   for (const r of review) if (r.chain === 'hypercore') { const x = afSenders.find(y => y.from === r.address); if (x) { delete x.credited; x.unidentified = 'possible sequencer burn, needs review'; } }
+  for (const x of afSenders) { const app = PO.get('hypercore:' + x.from); if (app) { delete x.credited; delete x.error; x.unidentified = poReason(app); } }
   const afCredited = afSenders.filter(x => x.credited);
   const afKntq = +afCredited.reduce((t, x) => t + x.kntq, 0).toFixed(6);
 
@@ -642,8 +649,8 @@ async function burns(prev, K, af) {
   // alerts once; the first run records what was already there without alerting.
   const alerted = new Set(prev?.alerted || []), first = !prev?.alerted, alerts = [];
   const flag = (who, what, reason) => { if (alerted.has(who)) return; alerted.add(who); if (!first) alerts.push({ at: now, who, what, reason }); };
-  for (const e of other) flag('elysium:' + e.actor, `burned ${e.kntq} KNTQ on Elysium (tx ${e.tx})`, e.reason);
-  for (const x of afSenders.filter(x => !x.credited)) flag('hypercore:' + x.from, `sent ${x.kntq.toFixed(2)} KNTQ to the Assistance Fund in ${x.sends} sends`, x.unidentified || x.error);
+  for (const e of other.filter(e => !e.project)) flag('elysium:' + e.actor, `burned ${e.kntq} KNTQ on Elysium (tx ${e.tx})`, e.reason);
+  for (const x of afSenders.filter(x => !x.credited && !PO.has('hypercore:' + x.from))) flag('hypercore:' + x.from, `sent ${x.kntq.toFixed(2)} KNTQ to the Assistance Fund in ${x.sends} sends`, x.unidentified || x.error);
   for (const a of alerts) log('ALERT source not identified:', a.who, a.what, '|', a.reason);
 
   return {
@@ -754,6 +761,12 @@ async function elysiumWallet(w, N, budget) {
   w.complete = w.pending.length === 0;
 }
 
+async function coreKntq(a) {
+  const r = await fetch(HL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'spotClearinghouseState', user: a }), signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error('hyperliquid spotClearinghouseState HTTP ' + r.status);
+  const j = await r.json(); if (!Array.isArray(j?.balances)) throw new Error('hyperliquid spotClearinghouseState: no balances');
+  return +(+(j.balances.find(b => b.coin === 'KNTQ')?.total || 0)).toFixed(6);
+}
 async function hypercoreWallet(w) {
   const a = w.address;
   const post = async body => { const r = await fetch(HL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
@@ -781,7 +794,7 @@ async function hypercoreWallet(w) {
   w.complete = true;
 }
 
-async function projects(prev, kq) {
+async function projects(prev, kq, hypePair) {
   const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
   const ours = file.projects || [];
   for (const p of ours) if (!p.name || !p.commitment) throw new Error('sources.json: project needs name and commitment ' + JSON.stringify(p));
@@ -809,6 +822,18 @@ async function projects(prev, kq) {
       else if (w.chain === 'hypercore') await hypercoreWallet(w);
       else { w.complete = false; w.error = 'HyperEVM wallet history is not read yet'; }
     } catch (e) { w.error = e.message; log(`wallet ${key} FAILED: ${e.message} (kept what was read)`); }
+    // what it holds now, and each buy in dollars at the hour it was bought (USDC at $1, HYPE at that hour's price)
+    try { w.kntq = w.chain === 'elysium' ? +e18(await erc20Bal(KNTQ_EVM, w.address)).toFixed(6) : w.chain === 'hypercore' ? await coreKntq(w.address) : null; }
+    catch (e) { w.kntq = null; log(`wallet ${key}: balance unreadable: ${e.message}`); }
+    for (const b of w.buys) if (b.usd == null) {
+      let usd = 0, missing = false;
+      for (const [sym, amt] of Object.entries(b.paid || {})) {
+        if (sym === 'USDC') usd += amt;
+        else if (sym === 'HYPE' || sym === 'WHYPE') { const p = hypePair ? await hourPx(hypePair, b.time * 1000) : null; if (p == null) missing = true; else usd += amt * p; }
+        else missing = true;
+      }
+      b.usd = missing ? null : +usd.toFixed(2);
+    }
     wallets.push(w);
   }
   // rows: our list, then Kinetiq's additions, each with the totals of its wallets
@@ -819,12 +844,15 @@ async function projects(prev, kq) {
     if (ws.length) Object.assign(row, { verified: true, complete: ws.every(w => w.complete && !w.error),
       bought: +buys.reduce((s, b) => s + b.kntq, 0).toFixed(6), paid: sumPaid(buys), burned: +burns.reduce((s, b) => s + b.kntq, 0).toFixed(6),
       buys: buys.length, lastBuy: buys.length ? Math.max(...buys.map(b => b.time)) : null,
+      held: ws.some(w => w.kntq == null) ? null : +ws.reduce((s, w) => s + w.kntq, 0).toFixed(6),
+      spentUsd: +buys.reduce((s, b) => s + (b.usd || 0), 0).toFixed(2), unpricedBuys: buys.filter(b => b.usd == null).length,
+      counted: !(file.apps || []).some(a => a.app === p.name && a.counted === false),
       reading: ws.reduce((s, w) => s + (w.pending?.length || 0), 0) });
     return row;
   });
   return { list, added: [...added.values()], wallets, alerted: [...alerted], alerts, atBlock: N };
 }
-const pj = await step('projects', () => projects(prev?.projects, data.kinetiq)); if (pj) data.projects = { ...pj, at: now };
+const pj = await step('projects', () => projects(prev?.projects, data.kinetiq, data.prices?.hypePair)); if (pj) data.projects = { ...pj, at: now };
 /* Montra on Elysium. Its pools earn fees in KNTQ; its buyback contract swaps that KNTQ for MONTRA in Montra's pool
    manager and the MONTRA is burned in the same transaction. So Montra spends KNTQ: the page shows it as a project
    row and never adds it to bought, queued or burned. Addresses are read from Montra's on-chain registry every run.
