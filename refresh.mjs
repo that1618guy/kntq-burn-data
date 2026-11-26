@@ -549,7 +549,7 @@ async function knownSources(seq, tre, sweep) {
   // other money, so it is never credited: a burn or Assistance Fund send from it is listed for review instead.
   const review = [...owners].map(a => ({ address: a, why: "owner of the sequencer's fee splitters; receives a share of fees" }));
   const file = JSON.parse(await readFile(KNOWN_FILE, 'utf8'));
-  // A wallet with counted: false (a project that buys and holds, e.g. Tesera) is shown in the projects table only: it is
+  // A wallet with counted: false (a project that buys and holds) is shown in the projects table only: it is
   // never a source, so its burns and Assistance Fund sends stay out of the sequencer-or-apps figures.
   const projectOnly = new Map();
   for (const a of file.apps || []) {
@@ -713,6 +713,8 @@ const kq = await step('kinetiq', () => kinetiq(data.ascendTreasury, data.assista
    The table is sources.json's projects list. Two things are added here:
    1. A project in Kinetiq's "projects buying KNTQ" data that is not in the list is added as pledged, not verifiable,
       with Kinetiq as its source, and raises an alert once. It leaves the added list when it is put into sources.json.
+      A project in sources.json excludedProjects (matched by Kinetiq slug, or by its title containing `match`) is never
+      added, so a project the editor removed stays removed.
    2. Each app wallet in sources.json has its whole history read: buys (KNTQ arriving in a transaction in which
       the wallet also paid something out, with what it paid) and burns (KNTQ to a burn address on Elysium, or to the
       Assistance Fund on Hyperliquid). History is cached per wallet; a wallet the cache has not seen yet is read from
@@ -799,11 +801,15 @@ async function projects(prev, kq, hypePair) {
   const ours = file.projects || [];
   for (const p of ours) if (!p.name || !p.commitment) throw new Error('sources.json: project needs name and commitment ' + JSON.stringify(p));
   const slugs = new Set(ours.map(p => p.kinetiq).filter(Boolean)), names = new Set(ours.map(p => p.name));
+  // Projects the editor has taken off the table: never added back from Kinetiq's list, by slug or by name.
+  const excl = file.excludedProjects || [];
+  for (const x of excl) if (!x.kinetiq && !x.match) throw new Error('sources.json: excluded project needs kinetiq or match ' + JSON.stringify(x));
+  const excluded = (slug, title) => excl.some(x => (x.kinetiq && x.kinetiq === slug) || (x.match && String(title || '').toLowerCase().includes(String(x.match).toLowerCase())));
   const alerted = new Set(prev?.alerted || []), alerts = [];
   const alert = (key, what) => { if (alerted.has(key)) return; alerted.add(key); alerts.push({ at: new Date().toISOString(), what }); log('ALERT', what); };
   // 1. Kinetiq's list against ours (kept from the last run when Kinetiq could not be read)
-  const added = new Map((prev?.added || []).filter(x => !slugs.has(x.kinetiq)).map(x => [x.kinetiq, x]));
-  if (kq) for (const p of kq.projects) if (!slugs.has(p.slug) && !added.has(p.slug))
+  const added = new Map((prev?.added || []).filter(x => !slugs.has(x.kinetiq) && !excluded(x.kinetiq, x.name)).map(x => [x.kinetiq, x]));
+  if (kq) for (const p of kq.projects) if (!slugs.has(p.slug) && !added.has(p.slug) && !excluded(p.slug, p.title))
     added.set(p.slug, { name: p.title, commitment: p.commitment, kinetiq: p.slug, source: 'kinetiq', firstSeen: new Date().toISOString() });
   for (const x of added.values()) alert('kinetiq:' + x.kinetiq, `Kinetiq lists a project buying KNTQ that is not in the table: ${x.name} ("${x.commitment}"). Added as pledged, not verifiable.`);
   // 2. app wallets, each with its whole history
@@ -850,7 +856,7 @@ async function projects(prev, kq, hypePair) {
       reading: ws.reduce((s, w) => s + (w.pending?.length || 0), 0) });
     return row;
   });
-  return { list, added: [...added.values()], wallets, alerted: [...alerted], alerts, atBlock: N };
+  return { list, added: [...added.values()], excluded: excl.map(x => ({ name: x.name, kinetiq: x.kinetiq || null, since: x.since || null })), wallets, alerted: [...alerted], alerts, atBlock: N };
 }
 const pj = await step('projects', () => projects(prev?.projects, data.kinetiq, data.prices?.hypePair)); if (pj) data.projects = { ...pj, at: now };
 /* Montra on Elysium. Its pools earn fees in KNTQ; its buyback contract swaps that KNTQ for MONTRA in Montra's pool

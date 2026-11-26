@@ -5,7 +5,7 @@
   "projects": [
     {
       "name": "Elysium sequencer",
-      "commitment": "50% of sequencer fees",
+      "commitment": "42.5% of sequencer fees (50% of the 85% Elysium keeps)",
       "kinetiq": "elysium-sequencer",
       "chain": "sequencer"
     },
@@ -77,30 +77,16 @@
       "kinetiq": "montra",
       "chain": "montra",
       "kind": "spend"
-    },
-    {
-      "name": "Tesera",
-      "commitment": "30% of fees, bought weekly and held",
-      "kinetiq": "tesera-lab",
-      "kind": "buy"
     }
   ],
-  "apps": [
+  "excludedProjects": [
     {
-      "address": "0x0f4d74359142dcb648d9ce7d2d01f247ce4f9bfa",
-      "chain": "elysium",
-      "app": "Tesera",
-      "label": "Tesera's treasury",
-      "evidence": "Given by the State of Blocks editor 2026-11-20; first buyback tx 0x378687be93857677920bea1e9cd986b2654057c60dd0baadce33a6c0f323a909 (Elysium) pays from this address",
-      "added": "2026-11-20"
-    },
-    {
-      "address": "0x0f4d74359142dcb648d9ce7d2d01f247ce4f9bfa",
-      "chain": "hypercore",
-      "app": "Tesera",
-      "label": "Tesera's treasury",
-      "evidence": "Given by the State of Blocks editor 2026-11-20; first buyback tx 0x378687be93857677920bea1e9cd986b2654057c60dd0baadce33a6c0f323a909 (Elysium) pays from this address",
-      "added": "2026-11-20"
+      "name": "Tesera",
+      "kinetiq": "tesera-lab",
+      "match": "tesera",
+      "why": "Removed from the terminal 2026-11-26 by the editor. Never re-added from Kinetiq's project list (matched by slug, or by name containing the match text). See notes/tesera.md to restore.",
+      "since": "2026-11-26"
     }
-  ]
+  ],
+  "apps": []
 }
