@@ -900,13 +900,113 @@ async function montra(prev, kntqPair) {
            lastBuy: last, counted: false, atBlock: N };
 }
 const mo = await step('montra', () => montra(prev?.montra, data.prices?.kntqPair)); if (mo) data.montra = { ...mo, at: now };
+/* ---------- Handed to Kinetiq's buyback bot ----------
+   Elysium's 85% share is paid to one wallet: the fee splitters' largest recipient, read from the chain. That wallet
+   withdraws part of what it receives to the parent chain. Each withdrawal lands on the destination's HyperCore account
+   about a day later (several may land together), and that account passes it on to Kinetiq's hourly Assistance Fund
+   buyer, which also spends Kinetiq's own money. Only HYPE that traces exactly from the wallet is counted:
+   - an arrival on HyperCore (a HYPE transfer from the HyperEVM system address) matches when it equals the sum of one
+     run of consecutive, not yet matched withdrawals from the wallet that happened before it, to the 1e-8 HYPE HyperCore
+     keeps (allowing 1e-8 of rounding per withdrawal);
+   - it is handed over when the same amount, exactly, then goes from that account to the buyer.
+   The destination's other funding never matches a withdrawal, so it is never counted. The buyer's KNTQ is never
+   credited to the sequencer, because the buyer's money is mixed: the page lowers queued by the HYPE handed over and
+   counts the buyer's Assistance Fund sends in total burned only, as it always has. */
+const AF_BUYER = '0xaa3b7392052d62928cc87701e3ca6fb6630bb6e2';    // Kinetiq's hourly Assistance Fund buyer
+const SYSTEM_HYPE = '0x2222222222222222222222222222222222222222';  // HyperEVM -> HyperCore HYPE transfers come from here
+const units8 = s => { const [i, f = ''] = String(s).split('.'); return BigInt(i) * 100000000n + BigInt((f + '00000000').slice(0, 8)); };
+const hype8 = u => +(Number(u) / 1e8).toFixed(8);
+async function sequencerHandover(seq, prev, afSenders) {
+  const rs = seq?.recipients || [];
+  if (!rs.length) throw new Error('the fee splitters have no recipients in this run');
+  const topBps = Math.max(...rs.map(r => r.bps));
+  const mains = [...new Set(rs.filter(r => r.bps === topBps).map(r => r.address.toLowerCase()))];
+  if (mains.length !== 1) throw new Error(`the splitters' largest recipients differ: ${mains.join(', ')}`);
+  const wallet = mains[0], p = prev?.wallet === wallet ? prev : null;
+  const N = parseInt(await rpc('eth_blockNumber', []), 16);
+  const startBlock = Math.min(...(seq.accounts || []).filter(a => a.contract).map(a => a.from));
+  if (!Number.isFinite(startBlock)) throw new Error('no fee-splitter account to start from');
+  // 1. the wallet's withdrawals, read incrementally. ArbSys does not index the caller, so every withdrawal is read.
+  const withdrawals = (p?.withdrawals || []).map(({ state, ...w }) => w), seen = new Set(withdrawals.map(w => w.tx + ':' + w.logIndex));
+  for (let a = p ? p.scannedTo + 1 : startBlock; a <= N; a += 200000) {
+    for (const l of await logsRange(ARBSYS, [L2_TO_L1_TX], a, Math.min(N, a + 199999))) {
+      if ('0x' + l.data.slice(26, 66) !== wallet) continue;
+      const wei = BigInt('0x' + l.data.slice(2 + 64 * 4, 2 + 64 * 5)), key = l.transactionHash + ':' + parseInt(l.logIndex, 16);
+      if (wei === 0n || seen.has(key)) continue; seen.add(key);
+      const blk = parseInt(l.blockNumber, 16);
+      withdrawals.push({ tx: l.transactionHash, logIndex: parseInt(l.logIndex, 16), block: blk, time: await blockTime(blk),
+                         destination: '0x' + l.topics[1].slice(-40), valueWei: wei.toString(), hype: +e18(wei).toFixed(9) });
+    }
+  }
+  withdrawals.sort((x, y) => x.block - y.block || x.logIndex - y.logIndex);
+  // 2. each destination's HyperCore HYPE transfers, read incrementally from the first withdrawal to it
+  const ledgers = {};
+  for (const d of [...new Set(withdrawals.map(w => w.destination))]) {
+    const pl = p?.ledgers?.[d], rows = [...(pl?.rows || [])], keys = new Set(rows.map(r => r.hash + r.from + r.to + r.amount));
+    let to = pl?.to ?? Math.min(...withdrawals.filter(w => w.destination === d).map(w => w.time)) * 1000 - 1, start = to + 1;
+    for (let page = 0; page < 40; page++) {
+      const r = await hlInfo({ type: 'userNonFundingLedgerUpdates', user: d, startTime: start, endTime: Date.now() });
+      if (!Array.isArray(r)) throw new Error(`Hyperliquid ledger for ${d} is not a list`);
+      if (!r.length) break;
+      for (const x of r) { const t = x.delta || {};
+        if (t.type === 'spotTransfer' && t.token === 'HYPE') {
+          const row = { hash: x.hash, time: x.time, from: (t.user || '').toLowerCase(), to: (t.destination || '').toLowerCase(), amount: String(t.amount) };
+          if (!keys.has(row.hash + row.from + row.to + row.amount)) { keys.add(row.hash + row.from + row.to + row.amount); rows.push(row); } }
+        to = Math.max(to, x.time); }
+      start = Math.max(...r.map(x => x.time)) + 1;
+      if (r.length < 500) break;
+      if (page === 39) throw new Error(`Hyperliquid ledger for ${d} did not finish in 40 pages`);
+    }
+    ledgers[d] = { to, rows: rows.sort((a, b) => a.time - b.time) };
+  }
+  // 3. match arrivals to withdrawals, then hand-overs to arrivals
+  const ws = withdrawals.map(w => ({ ...w, u: BigInt(w.valueWei) / 10000000000n, state: 'withdrawn' }));
+  const arrivals = [], handed = [];
+  for (const [d, L] of Object.entries(ledgers)) {
+    const mine = ws.filter(w => w.destination === d);
+    const outs = L.rows.filter(r => r.from === d && r.to === AF_BUYER).map(r => ({ ...r, used: false }));
+    for (const a of L.rows.filter(r => r.from === SYSTEM_HYPE && r.to === d)) {
+      const au = units8(a.amount), open = mine.filter(w => w.state === 'withdrawn' && w.time * 1000 <= a.time);
+      let hit = null, diff = 0n;
+      for (let i = 0; i < open.length && !hit; i++) {
+        let sum = 0n;
+        for (let k = i; k < Math.min(open.length, i + 8); k++) {
+          sum += open[k].u; const n = BigInt(k - i + 1);
+          if (sum - au <= n && au - sum <= n) { hit = open.slice(i, k + 1); diff = au - sum; break; }
+          if (sum > au + n) break;
+        }
+      }
+      if (!hit) { arrivals.push({ hash: a.hash, time: a.time, destination: d, hype: hype8(au), units: au.toString(), counted: false }); continue; }
+      for (const w of hit) w.state = 'arrived';
+      const o = outs.find(x => !x.used && x.time >= a.time && units8(x.amount) === au);
+      const rec = { arrivalHash: a.hash, arrivalTime: a.time, destination: d, hype: hype8(au), units: au.toString(),
+                    roundingUnits: Number(diff), withdrawals: hit.map(w => w.tx) };
+      if (o) { o.used = true; for (const w of hit) w.state = 'handed'; handed.push({ ...rec, hash: o.hash, time: o.time, to: AF_BUYER }); }
+      arrivals.push({ hash: a.hash, time: a.time, destination: d, hype: hype8(au), units: au.toString(), counted: true, handed: !!o });
+    }
+  }
+  const sumU = xs => xs.reduce((t, x) => t + x, 0n), warnings = [];
+  const buyer = (afSenders || []).find(x => x.from === AF_BUYER);
+  if (!buyer || !(buyer.kntq > 0)) warnings.push({ what: `${AF_BUYER} is not a sender to the Assistance Fund in this run's data; check it is still Kinetiq's buyer` });
+  const pending = ws.filter(w => w.state === 'withdrawn'), atDest = arrivals.filter(a => a.counted && !a.handed);
+  for (const w of warnings) log('WARNING handover', w.what);
+  log(`handover: ${handed.length} hand-overs, ${hype8(sumU(handed.map(h => BigInt(h.units))))} HYPE from ${wallet} to the buyer; ` +
+      `${pending.length} withdrawals on their way; ${arrivals.filter(a => !a.counted).length} arrivals from other funding not counted`);
+  return { wallet, buyer: AF_BUYER, buyerKntqToFund: buyer ? buyer.kntq : null,
+           handedHype: hype8(sumU(handed.map(h => BigInt(h.units)))), handed,
+           inTransitHype: +e18(pending.reduce((t, w) => t + BigInt(w.valueWei), 0n)).toFixed(9), inTransit: pending.length,
+           atDestinationHype: hype8(sumU(atDest.map(a => BigInt(a.units)))),
+           otherFundingHype: hype8(sumU(arrivals.filter(a => !a.counted).map(a => BigInt(a.units)))),
+           withdrawals: ws.map(({ u, ...w }) => w), arrivals, ledgers, scannedTo: N, warnings, atBlock: N };
+}
+const ho = await step('sequencerHandover', () => sequencerHandover(data.sequencer, prev?.sequencerHandover, data.assistanceFund?.senders)); if (ho) data.sequencerHandover = { ...ho, at: now };
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury, data.sequencerSweep));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
 data.oku = { status: 'pledged', counted: false, pledge: '40% of net trading fees on Elysium', announced: '2026-11-07',
              note: 'No Oku fee wallet, Elysium deployment address or burn address has been published.' };
 if (!seq && !asc && !tre && !hl) { console.error('nothing refreshed; data.json left untouched'); process.exit(1); }
-data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic], ['montra', data.montra], ['sequencerSweep', data.sequencerSweep]]
+data.warnings = [['ascendTreasury', data.ascendTreasury], ['ascendStrategic', data.ascendStrategic], ['montra', data.montra], ['sequencerSweep', data.sequencerSweep], ['sequencerHandover', data.sequencerHandover]]
   .flatMap(([k, v]) => (v?.warnings || []).map(w => ({ step: k, ...w })));
 await writeFile(OUT, JSON.stringify(data));
 log('wrote data.json', Object.keys(data.errors).length ? 'with errors: ' + Object.keys(data.errors).join(', ') : 'clean', data.warnings.length ? `(${data.warnings.length} warnings)` : '');
