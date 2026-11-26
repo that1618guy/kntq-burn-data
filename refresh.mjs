@@ -916,7 +916,7 @@ const AF_BUYER = '0xaa3b7392052d62928cc87701e3ca6fb6630bb6e2';    // Kinetiq's h
 const SYSTEM_HYPE = '0x2222222222222222222222222222222222222222';  // HyperEVM -> HyperCore HYPE transfers come from here
 const units8 = s => { const [i, f = ''] = String(s).split('.'); return BigInt(i) * 100000000n + BigInt((f + '00000000').slice(0, 8)); };
 const hype8 = u => +(Number(u) / 1e8).toFixed(8);
-async function sequencerHandover(seq, prev, afSenders) {
+async function sequencerHandover(seq, prev, afSenders, pairs = {}) {
   const rs = seq?.recipients || [];
   if (!rs.length) throw new Error('the fee splitters have no recipients in this run');
   const topBps = Math.max(...rs.map(r => r.bps));
@@ -985,7 +985,36 @@ async function sequencerHandover(seq, prev, afSenders) {
       arrivals.push({ hash: a.hash, time: a.time, destination: d, hype: hype8(au), units: au.toString(), counted: true, handed: !!o });
     }
   }
+  /* An estimate, labelled as one on the page: the KNTQ each hand-over could buy, at the typical prices of the Hyperliquid
+     1-hour candles of the hour it reached the buyer (HYPE x HYPE price / KNTQ price). The buyer's actual buys are mixed
+     with Kinetiq's own money and cannot be split, so this is never added to any burned total. Stored with each
+     hand-over once found, so it never moves with later prices. */
+  const prevEst = new Map((p?.handed || []).filter(h => h.estKntq != null).map(h => [h.hash, h]));
+  for (const h of handed) {
+    const o = prevEst.get(h.hash);
+    if (o) { Object.assign(h, { hypeUsd: o.hypeUsd, kntqUsd: o.kntqUsd, estKntq: o.estKntq }); continue; }
+    const hp = await hourPx(pairs.hype, h.time), kp = await hourPx(pairs.kntq, h.time);
+    Object.assign(h, hp > 0 && kp > 0 ? { hypeUsd: +hp.toFixed(6), kntqUsd: +kp.toFixed(8), estKntq: +(h.hype * hp / kp).toFixed(2) } : { hypeUsd: hp ?? null, kntqUsd: kp ?? null, estKntq: null });
+  }
+  /* Check on the estimate: it can never be more than the KNTQ the buyer actually sent to the Assistance Fund since the
+     first hand-over, from all its money. That total is read from the buyer's ledger, incrementally. */
+  const firstAt = handed.length ? Math.min(...handed.map(h => h.time)) : null;
+  let buyerSent = p?.buyerSent && p.buyerSent.since === firstAt ? { ...p.buyerSent } : (firstAt ? { since: firstAt, to: firstAt - 1, kntq: 0 } : null);
+  if (buyerSent) for (let page = 0, start = buyerSent.to + 1; page < 60; page++) {
+    const r = await hlInfo({ type: 'userNonFundingLedgerUpdates', user: AF_BUYER, startTime: start, endTime: Date.now() });
+    if (!Array.isArray(r)) throw new Error('Hyperliquid ledger for the buyer is not a list');
+    if (!r.length) break;
+    for (const x of r) { const t = x.delta || {};
+      if (t.token === 'KNTQ' && ['send', 'spotTransfer'].includes(t.type) && (t.user || '').toLowerCase() === AF_BUYER && (t.destination || '').toLowerCase() === AF) buyerSent.kntq += +t.amount;
+      buyerSent.to = Math.max(buyerSent.to, x.time); }
+    start = Math.max(...r.map(x => x.time)) + 1;
+    if (r.length < 500) break;
+    if (page === 59) throw new Error('the buyer\'s ledger did not finish in 60 pages');
+  }
+  if (buyerSent) buyerSent.kntq = +buyerSent.kntq.toFixed(6);
   const sumU = xs => xs.reduce((t, x) => t + x, 0n), warnings = [];
+  const unpriced = handed.filter(h => h.estKntq == null);
+  if (unpriced.length) warnings.push({ what: `${unpriced.length} hand-overs could not be priced; the KNTQ estimate leaves them out` });
   const buyer = (afSenders || []).find(x => x.from === AF_BUYER);
   if (!buyer || !(buyer.kntq > 0)) warnings.push({ what: `${AF_BUYER} is not a sender to the Assistance Fund in this run's data; check it is still Kinetiq's buyer` });
   const pending = ws.filter(w => w.state === 'withdrawn'), atDest = arrivals.filter(a => a.counted && !a.handed);
@@ -993,13 +1022,17 @@ async function sequencerHandover(seq, prev, afSenders) {
   log(`handover: ${handed.length} hand-overs, ${hype8(sumU(handed.map(h => BigInt(h.units))))} HYPE from ${wallet} to the buyer; ` +
       `${pending.length} withdrawals on their way; ${arrivals.filter(a => !a.counted).length} arrivals from other funding not counted`);
   return { wallet, buyer: AF_BUYER, buyerKntqToFund: buyer ? buyer.kntq : null,
+           ...(() => { const raw = +handed.reduce((t, h) => t + (h.estKntq || 0), 0).toFixed(2), cap = buyerSent ? buyerSent.kntq : null;
+                       if (cap != null && raw > cap) warnings.push({ what: `KNTQ estimate ${raw} is more than the buyer sent to the Assistance Fund since the first hand-over (${cap}); capped` });
+                       return { estKntq: cap != null ? Math.min(raw, cap) : raw, estKntqRaw: raw, estCapped: cap != null && raw > cap }; })(),
+           estUnpriced: unpriced.length, firstHandedAt: firstAt, buyerSent,
            handedHype: hype8(sumU(handed.map(h => BigInt(h.units)))), handed,
            inTransitHype: +e18(pending.reduce((t, w) => t + BigInt(w.valueWei), 0n)).toFixed(9), inTransit: pending.length,
            atDestinationHype: hype8(sumU(atDest.map(a => BigInt(a.units)))),
            otherFundingHype: hype8(sumU(arrivals.filter(a => !a.counted).map(a => BigInt(a.units)))),
            withdrawals: ws.map(({ u, ...w }) => w), arrivals, ledgers, scannedTo: N, warnings, atBlock: N };
 }
-const ho = await step('sequencerHandover', () => sequencerHandover(data.sequencer, prev?.sequencerHandover, data.assistanceFund?.senders)); if (ho) data.sequencerHandover = { ...ho, at: now };
+const ho = await step('sequencerHandover', () => sequencerHandover(data.sequencer, prev?.sequencerHandover, data.assistanceFund?.senders, { hype: data.prices?.hypePair, kntq: data.prices?.kntqPair })); if (ho) data.sequencerHandover = { ...ho, at: now };
 const K  = await step('knownSources', () => knownSources(data.sequencer, data.ascendTreasury, data.sequencerSweep));
 const bn = K && await step('burns', () => burns(prev?.burns, K, data.assistanceFund)); if (bn) data.burns = { ...bn, at: now };
 delete data.elysiumBurns;                           // the previous format; the live page reads data.burns
